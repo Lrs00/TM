@@ -1,0 +1,458 @@
+---
+title: "Gom DE_revised"
+output: pdf_document
+date: "2025-11-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## GomDE adapted to the topics
+```{r}
+library(MCMCpack)
+library(MASS)
+library(ggplot2)
+library(tidyr)
+library(fastTopics)
+library(limma)
+library(clue)
+
+# ----------------------------------------------------------
+# Distance and error utilities
+# ----------------------------------------------------------
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1*v2) /
+        (sqrt(sum(v1^2)*sum(v2^2)) + 1e-20)
+      D[k,j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(mean_error = mean(diffs),
+       max_error  = max(diffs))
+}
+
+compute_similarity_matrix <- function(W_true) {
+  K <- nrow(W_true)
+  S <- matrix(NA_real_, K, K)
+  for (i in 1:K)
+    for (j in 1:K) {
+      v1 <- W_true[i,];  
+      v2 <- W_true[j,]
+      S[i,j] <- sum(v1*v2) / 
+        (sqrt(sum(v1^2))*sqrt(sum(v2^2)) + 1e-20)
+    }
+  S
+}
+
+# ----------------------------------------------------------
+# Simulation settings
+# ----------------------------------------------------------
+K_values <- c(6,9)
+nsim <- 20
+
+all_results_BH <- list()
+all_results_BY <- list()
+row_BH <- 1
+row_BY <- 1
+
+# ⭐ NEW: storage for W_est
+all_W <- list()
+w_row <- 1
+
+set.seed(1005)
+
+# ==========================================================
+#                     MAIN LOOP
+# ==========================================================
+for (K in K_values) {
+
+  cat("\n============================\n")
+  cat("Running K =", K, "\n")
+  cat("============================\n")
+
+  for (sim in 1:nsim) {
+
+    # ----------------------
+    # Generate simulation
+    # ----------------------
+    N <- 1000; G <- 500
+    beta_strength <- 2
+    set.seed(100 + sim)
+
+    X <- rbinom(N, 1, 0.5)
+
+    mu_k <- rnorm(K, 0, 1)
+    diff_k <- rep(FALSE, K)
+    diff_idx <- sample(1:K, 2)
+    diff_k[diff_idx] <- TRUE
+    beta_k <- ifelse(diff_k, rnorm(K, beta_strength, 0.5), 0)
+
+    eta <- sapply(1:K, function(k) rnorm(N, mu_k[k] + X*beta_k[k], 1))
+    E <- exp(eta)
+
+    T_mat <- matrix(rlnorm(K*G, 0, 1), K, G)
+    W_true <- t(apply(T_mat, 1, function(a) rdirichlet(1, a)))
+
+    l_n <- runif(N, 1000, 10000)
+    mean_ng <- (E %*% W_true) * l_n
+    Y_ng <- matrix(rpois(N*G, as.vector(mean_ng)), N, G)
+
+    # ----------------------
+    # fastTopics
+    # ----------------------
+    fit <- fit_poisson_nmf(Y_ng, k = K, numiter = 200, verbose = "none")
+    fit_multinom <- poisson2multinom(fit)
+    beta_hat <- fit_multinom$F
+
+    # ----------------------
+    # Topic alignment
+    # ----------------------
+    D <- compute_distance_matrix(W_true, t(beta_hat))
+    assignment <- solve_LSAP(D)
+    beta_hat <- beta_hat[, assignment]
+    W_est_aligned <- t(beta_hat)
+
+    err <- compute_topic_error(W_true, W_est_aligned)
+
+    # --------------------------------------------------
+    # Similarity of null to true topics
+    # --------------------------------------------------
+    S <- compute_similarity_matrix(W_true)
+
+    true_topics <- which(diff_k)
+    null_topics <- which(!diff_k)
+
+    max_sim_null <- sapply(null_topics, function(k)
+      max(S[k, true_topics])
+    )
+
+    mean_null_sim  <- mean(max_sim_null)
+    max_null_sim   <- max(max_sim_null)
+    median_null_sim <- median(max_sim_null)
+
+    # ----------------------
+    # Per-cell GLM → W_est
+    # ----------------------
+    W_est <- matrix(NA_real_, nrow=N, ncol=K)
+
+    for (ii in 1:N) {
+      y_i <- Y_ng[ii, ]
+      X_i <- l_n[ii] * beta_hat
+
+      df_i <- data.frame(y=y_i, X_i)
+      colnames(df_i) <- c("y", paste0("B",1:K))
+
+      form_i <- as.formula(
+        paste("y ~", paste(colnames(df_i)[-1], collapse=" + "), "- 1")
+      )
+
+      fit_i <- try(
+        glm(form_i, data=df_i, family=poisson(link="identity"),
+            start=rep(mean(y_i)/K, K)),
+        silent = TRUE
+      )
+
+      coef_i <- if (inherits(fit_i, "try-error")) rep(0, K) else coef(fit_i)
+      W_est[ii, ] <- pmax(coef_i, 0)
+    }
+
+    # ⭐⭐⭐ NEW: STORE W_est ⭐⭐⭐
+    all_W[[w_row]] <- list(
+      K        = K,
+      sim      = sim,
+      W_est    = W_est,
+      W_true   = W_true,
+      diff_k   = diff_k,
+      X        = X,
+      l_n      = l_n
+    )
+    w_row <- w_row + 1
+    # ----------------------------------------------------
+
+    # ----------------------
+    # LIMMA on log W_est
+    # ----------------------
+    W_log <- log(W_est + 1e-8)
+    fitL <- lmFit(t(W_log), model.matrix(~ X))
+    fitL <- eBayes(fitL)
+    tt   <- topTable(fitL, coef = 2, number = Inf, sort.by="none")
+    pvals <- tt$P.Value
+
+    # ======================
+    #     (1) BH
+    # ======================
+    
+    detected_BH <- p.adjust(pvals, "BH") < 0.05
+    
+    TP_BH <- sum(detected_BH & diff_k)
+    FP_BH <- sum(detected_BH & !diff_k)
+    Power_BH <- TP_BH / sum(diff_k)
+    FDP_BH   <- ifelse(sum(detected_BH)==0, 0, FP_BH / sum(detected_BH))
+    
+    # NEW: list detected topics
+    detected_topics_BH <- if (any(detected_BH)) {
+      paste(which(detected_BH), collapse = ",")
+    } else {
+      "none"
+    }
+    
+    all_results_BH[[row_BH]] <- data.frame(
+      Adjust = "BH",
+      K = K,
+      sim = sim,
+      TP = TP_BH,
+      FP = FP_BH,
+      Power = Power_BH,
+      FDP   = FDP_BH,
+      mean_err = err$mean_error,
+      max_err  = err$max_error,
+      mean_null_sim = mean_null_sim,
+      max_null_sim = max_null_sim,
+      median_null_sim = median_null_sim,
+      detected_topics = detected_topics_BH   ## NEW
+    )
+    row_BH <- row_BH + 1
+
+    # detected_BH <- p.adjust(pvals, "BH") < 0.05
+    # 
+    # TP_BH <- sum(detected_BH & diff_k)
+    # FP_BH <- sum(detected_BH & !diff_k)
+    # Power_BH <- TP_BH / sum(diff_k)
+    # FDP_BH   <- ifelse(sum(detected_BH)==0, 0, FP_BH / sum(detected_BH))
+    # 
+    # all_results_BH[[row_BH]] <- data.frame(
+    #   Adjust = "BH",
+    #   K = K,
+    #   sim = sim,
+    #   TP = TP_BH,
+    #   FP = FP_BH,
+    #   Power = Power_BH,
+    #   FDP   = FDP_BH,
+    #   mean_err = err$mean_error,
+    #   max_err  = err$max_error,
+    #   mean_null_sim = mean_null_sim,
+    #   max_null_sim = max_null_sim,
+    #   median_null_sim = median_null_sim
+    # )
+    # row_BH <- row_BH + 1
+
+    # ======================
+    #     (2) BY
+    # ======================
+    
+    detected_BY <- p.adjust(pvals, "BY") < 0.05
+    
+    TP_BY <- sum(detected_BY & diff_k)
+    FP_BY <- sum(detected_BY & !diff_k)
+    Power_BY <- TP_BY / sum(diff_k)
+    FDP_BY   <- ifelse(sum(detected_BY)==0, 0, FP_BY / sum(detected_BY))
+    
+    # NEW: detected topics list
+    detected_topics_BY <- if (any(detected_BY)) {
+      paste(which(detected_BY), collapse = ",")
+    } else {
+      "none"
+    }
+    
+    all_results_BY[[row_BY]] <- data.frame(
+      Adjust = "BY",
+      K = K,
+      sim = sim,
+      TP = TP_BY,
+      FP = FP_BY,
+      Power = Power_BY,
+      FDP   = FDP_BY,
+      mean_err = err$mean_error,
+      max_err  = err$max_error,
+      mean_null_sim = mean_null_sim,
+      max_null_sim = max_null_sim,
+      median_null_sim = median_null_sim,
+      detected_topics = detected_topics_BY   ## NEW
+    )
+    row_BY <- row_BY + 1
+
+    # detected_BY <- p.adjust(pvals, "BY") < 0.05
+    # 
+    # TP_BY <- sum(detected_BY & diff_k)
+    # FP_BY <- sum(detected_BY & !diff_k)
+    # Power_BY <- TP_BY / sum(diff_k)
+    # FDP_BY   <- ifelse(sum(detected_BY)==0, 0, FP_BY / sum(detected_BY))
+    # 
+    # all_results_BY[[row_BY]] <- data.frame(
+    #   Adjust = "BY",
+    #   K = K,
+    #   sim = sim,
+    #   TP = TP_BY,
+    #   FP = FP_BY,
+    #   Power = Power_BY,
+    #   FDP   = FDP_BY,
+    #   mean_err = err$mean_error,
+    #   max_err  = err$max_error,
+    #   mean_null_sim = mean_null_sim,
+    #   max_null_sim = max_null_sim,
+    #   median_null_sim = median_null_sim
+    # )
+    # row_BY <- row_BY + 1
+  }
+}
+
+# -------------------------------
+# Final BH / BY results
+# -------------------------------
+output_BH <- do.call(rbind, all_results_BH)
+output_BY <- do.call(rbind, all_results_BY)
+
+```
+```{r}
+for (i in seq_along(all_W)) {
+
+  K        <- all_W[[i]]$K
+  sim      <- all_W[[i]]$sim
+  W_est    <- all_W[[i]]$W_est
+  X        <- all_W[[i]]$X
+  diff_k   <- all_W[[i]]$diff_k
+
+  # -----------------------------
+  # Build W_long (your code)
+  # -----------------------------
+  W_df <- as.data.frame(W_est)
+  colnames(W_df) <- paste0("Topic", 1:K)
+
+  W_df$Condition <- factor(X, labels = c("Control", "Treatment"))
+
+  W_long <- W_df %>%
+    pivot_longer(
+      cols = starts_with("Topic"),
+      names_to = "Topic",
+      values_to = "Activity"
+    )
+
+  # -----------------------------
+  # Plot 1
+  # -----------------------------
+  # p1 <- ggplot(W_long, aes(x = Topic, y = Activity, fill = Condition)) +
+  #   geom_boxplot(outlier.alpha = 0.2) +
+  #   scale_y_log10() +
+  #   theme_bw() +
+  #   labs(
+  #     title = paste("Estimated topic activities W_est — K =", K, "Simulation =", sim),
+  #     y = "Estimated activity",
+  #     x = "Topic"
+  #   )
+  # print(p1)
+
+  # -----------------------------
+  # Truth annotation
+  # -----------------------------
+  true_topics <- paste0("Topic", which(diff_k))
+  W_long$Truth <- ifelse(W_long$Topic %in% true_topics,
+                         "True DE", "Null")
+
+  # -----------------------------
+  # Plot 2
+  # -----------------------------
+  p2 <- ggplot(W_long, aes(x = Topic, y = Activity, fill = Condition)) +
+    geom_boxplot(outlier.alpha = 0.2) +
+    facet_wrap(~ Truth, scales = "free_x") +
+    scale_y_log10() +
+    theme_bw() +
+    labs(
+      title = paste("Estimated W_est with truth annotation — K =", K, "sim =", sim),
+      y = "Estimated activity",
+      x = "Topic"
+    )
+  print(p2)
+
+  # (optional: save)
+  # ggsave(paste0("plot1_K", K, "_sim", sim, ".png"), p1, width=7, height=5)
+  # ggsave(paste0("plot2_K", K, "_sim", sim, ".png"), p2, width=7, height=5)
+}
+
+```
+
+```{r}
+output_BH
+```
+
+## FDP >0.05
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# bad runs: FDP > 0.05
+bad_runs <- output_BH %>% filter(FDP > 0.05)
+
+for (i in seq_along(all_W)) {
+
+  K      <- all_W[[i]]$K
+  sim    <- all_W[[i]]$sim
+
+  # ---- skip if this (K, sim) is not a bad run ----
+  if (!( (K %in% bad_runs$K) & (sim %in% bad_runs$sim[bad_runs$K == K]) )) {
+    next
+  }
+
+  W_est  <- all_W[[i]]$W_est
+  X      <- all_W[[i]]$X
+  diff_k <- all_W[[i]]$diff_k
+
+  # -----------------------------
+  # Build W_long 
+  # -----------------------------
+  W_df <- as.data.frame(W_est)
+  colnames(W_df) <- paste0("Topic", 1:K)
+  W_df$Condition <- factor(X, labels = c("Control", "Treatment"))
+
+  W_long <- W_df %>%
+    pivot_longer(
+      cols = starts_with("Topic"),
+      names_to = "Topic",
+      values_to = "Activity"
+    )
+
+  # -----------------------------
+  # Truth annotation
+  # -----------------------------
+  true_topics <- paste0("Topic", which(diff_k))
+  W_long$Truth <- ifelse(W_long$Topic %in% true_topics, "True DE", "Null")
+
+  # -----------------------------
+  # Plot ONLY bad FDP cases
+  # -----------------------------
+  p2 <- ggplot(W_long, aes(x = Topic, y = Activity, fill = Condition)) +
+    geom_boxplot(outlier.alpha = 0.2) +
+    facet_wrap(~ Truth, scales = "free_x") +
+    scale_y_log10() +
+    theme_bw() +
+    labs(
+      title = paste("High-FDP Case — K =", K, "sim =", sim, "(FDP > 0.05)"),
+      y = "Estimated activity",
+      x = "Topic"
+    )
+
+  print(p2)
+}
+
+```
+
+```{r}
+output_BH_highFDP <- subset(output_BH, FDP > 0.05)
+output_BH_highFDP
+
+```
+
+
+
