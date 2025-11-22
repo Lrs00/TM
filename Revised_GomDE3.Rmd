@@ -1,0 +1,493 @@
+---
+title: "Revised_GomDE3"
+output: pdf_document
+date: "2025-11-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## True topic =2 when k= 6, 9 adapting Gom De idea
+```{r}
+library(MCMCpack)
+library(MASS)
+library(ggplot2)
+library(tidyr)
+library(fastTopics)
+library(limma)
+library(clue)
+
+# ----------------------------------------------------------
+# Distance and error utilities
+# ----------------------------------------------------------
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1*v2) /
+                 (sqrt(sum(v1^2)*sum(v2^2)) + 1e-20)
+      D[k,j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(mean_error = mean(diffs),
+       max_error  = max(diffs))
+}
+
+# cosine similarity matrix among true topics
+compute_similarity_matrix <- function(W_true) {
+  K <- nrow(W_true)
+  S <- matrix(NA_real_, K, K)
+  for (i in 1:K)
+    for (j in 1:K) {
+      v1 <- W_true[i,];  v2 <- W_true[j,]
+      S[i,j] <- sum(v1*v2) / 
+                (sqrt(sum(v1^2))*sqrt(sum(v2^2)) + 1e-20)
+    }
+  S
+}
+
+# ----------------------------------------------------------
+# Simulation settings
+# ----------------------------------------------------------
+## 15, 30
+K_values <- c(6, 9)
+nsim <- 20
+
+all_results_BH <- list()
+all_results_BY <- list()
+row_BH <- 1
+row_BY <- 1
+
+set.seed(1005)
+
+# ==========================================================
+#                     MAIN LOOP
+# ==========================================================
+for (K in K_values) {
+
+  cat("\n============================\n")
+  cat("Running K =", K, "\n")
+  cat("============================\n")
+
+  for (sim in 1:nsim) {
+
+    # ----------------------
+    # Generate simulation
+    # ----------------------
+    N <- 1000; G <- 500
+    beta_strength <- 2
+    set.seed(100 + sim)
+
+    X <- rbinom(N, 1, 0.5)
+
+    mu_k <- rnorm(K, 0, 1)
+    diff_k <- rep(FALSE, K)
+    diff_idx <- sample(1:K, 2)
+    diff_k[diff_idx] <- TRUE
+    beta_k <- ifelse(diff_k, rnorm(K, beta_strength, 0.5), 0)
+
+    eta <- sapply(1:K, function(k) rnorm(N, mu_k[k] + X*beta_k[k], 1))
+    E <- exp(eta)
+
+    T_mat <- matrix(rlnorm(K*G, 0, 1), K, G)
+    W_true <- t(apply(T_mat, 1, function(a) rdirichlet(1, a)))
+
+    l_n <- runif(N, 1000, 10000)
+    mean_ng <- (E %*% W_true) * l_n
+    Y_ng <- matrix(rpois(N*G, as.vector(mean_ng)), N, G)
+
+    # ----------------------
+    # fastTopics
+    # ----------------------
+    fit <- fit_poisson_nmf(Y_ng, k=K, numiter=200, verbose="none")
+    fit_multinom <- poisson2multinom(fit)
+    beta_hat <- fit_multinom$F
+
+    # ----------------------
+    # Topic alignment
+    # ----------------------
+    D <- compute_distance_matrix(W_true, t(beta_hat))
+    assignment <- solve_LSAP(D)
+    beta_hat <- beta_hat[, assignment]
+    W_est_aligned <- t(beta_hat)
+
+    # topic estimation error
+    err <- compute_topic_error(W_true, W_est_aligned)
+
+    # --------------------------------------------------
+    # New: Compute similarity of null topics to true topics
+    # --------------------------------------------------
+    S <- compute_similarity_matrix(W_true)
+
+    true_topics <- which(diff_k)
+    null_topics <- which(!diff_k)
+
+    # for each null topic k: max_cosine_similarity to any true topic
+    max_sim_null <- sapply(null_topics, function(k)
+      max(S[k, true_topics])
+    )
+
+    mean_null_sim  <- mean(max_sim_null)
+    max_null_sim   <- max(max_sim_null)
+    median_null_sim <- median(max_sim_null)
+
+    # ----------------------
+    # Per-cell GLM → W_est
+    # ----------------------
+    W_est <- matrix(NA_real_, nrow=N, ncol=K)
+    for (ii in 1:N) {
+      y_i <- Y_ng[ii, ]
+      X_i <- l_n[ii] * beta_hat
+
+      df_i <- data.frame(y=y_i, X_i)
+      colnames(df_i) <- c("y", paste0("B",1:K))
+
+      form_i <- as.formula(
+        paste("y ~", paste(colnames(df_i)[-1], collapse=" + "), "- 1")
+      )
+
+      fit_i <- try(
+        glm(form_i, data=df_i, family=poisson(link="identity"),
+            start=rep(mean(y_i)/K, K)),
+        silent=TRUE
+      )
+
+      coef_i <- if (inherits(fit_i,"try-error")) rep(0,K) else coef(fit_i)
+      W_est[ii,] <- pmax(coef_i, 0)
+    }
+
+    # ----------------------
+    # LIMMA on log W_est
+    # ----------------------
+    W_log <- log(W_est + 1e-8)
+    fitL <- lmFit(t(W_log), model.matrix(~ X))
+    fitL <- eBayes(fitL)
+    tt   <- topTable(fitL, coef = 2, number = Inf, sort.by="none")
+    pvals <- tt$P.Value
+
+    # ======================
+    #     (1) BH
+    # ======================
+    detected_BH <- p.adjust(pvals, "BH") < 0.05
+
+    TP_BH <- sum(detected_BH & diff_k)
+    FP_BH <- sum(detected_BH & !diff_k)
+    Power_BH <- TP_BH / sum(diff_k)
+    FDP_BH   <- ifelse(sum(detected_BH)==0, 0, FP_BH / sum(detected_BH))
+
+    all_results_BH[[row_BH]] <- data.frame(
+      Adjust = "BH",
+      K = K,
+      sim = sim,
+      TP = TP_BH,
+      FP = FP_BH,
+      Power = Power_BH,
+      FDP   = FDP_BH,
+      mean_err = err$mean_error,
+      max_err  = err$max_error,
+      mean_null_sim = mean_null_sim,
+      max_null_sim = max_null_sim,
+      median_null_sim = median_null_sim
+    )
+    row_BH <- row_BH + 1
+
+    # ======================
+    #     (2) BY
+    # ======================
+    detected_BY <- p.adjust(pvals, "BY") < 0.05
+
+    TP_BY <- sum(detected_BY & diff_k)
+    FP_BY <- sum(detected_BY & !diff_k)
+    Power_BY <- TP_BY / sum(diff_k)
+    FDP_BY   <- ifelse(sum(detected_BY)==0, 0, FP_BY / sum(detected_BY))
+
+    all_results_BY[[row_BY]] <- data.frame(
+      Adjust = "BY",
+      K = K,
+      sim = sim,
+      TP = TP_BY,
+      FP = FP_BY,
+      Power = Power_BY,
+      FDP   = FDP_BY,
+      mean_err = err$mean_error,
+      max_err  = err$max_error,
+      mean_null_sim = mean_null_sim,
+      max_null_sim = max_null_sim,
+      median_null_sim = median_null_sim
+    )
+    row_BY <- row_BY + 1
+  }
+}
+
+output_BH <- do.call(rbind, all_results_BH)
+output_BY <- do.call(rbind, all_results_BY)
+
+```
+```{r}
+output_BH
+```
+
+```{r}
+ggplot(output_BH, aes(mean_err, FDP)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Mean topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K)--BH"
+  )
+
+
+ggplot(output_BH, aes(max_err, FDP)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Max topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K)--BH"
+  )
+
+ggplot(output_BH, aes(x = factor(K), y = FDP, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Mean topic error",
+    title = "FDP vs K (colored by mean topic-model estimation error--BH)"
+  )
+
+ggplot(output_BH, aes(x = factor(K), y = Power, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "Power",
+    color = "Mean topic error",
+    title = "Power vs K (colored by topic-model estimation error--BH)"
+  )
+```
+```{r}
+output_BH$sim_id <- seq_len(nrow(output_BH))
+set.seed(1005)
+ggplot(output_BH, aes(
+  x = factor(K),
+  y = FDP,
+  color = mean_err,
+  group = sim_id        # <--- keeps order stable!
+)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Mean topic error",
+    title = "FDP vs K (colored by mean topic-model estimation error--BH)"
+  )
+set.seed(1005)
+
+ggplot(output_BH, aes(
+  x = factor(K),
+  y = FDP,
+  color = max_err,
+  group = sim_id        # <--- keeps order stable!
+)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max topic error",
+    title = "FDP vs K (colored by max topic-model estimation error--BH)"
+  )
+set.seed(1005)
+
+ggplot(output_BH, aes(
+  x = factor(K),
+  y = FDP,
+  color = mean_null_sim,
+  group = sim_id        # <--- keeps order stable!
+)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Mean similarity\n(null → true)",
+    title = "FDP vs K (colored by mean similarity of null topics--BH)"
+  )
+set.seed(1005)
+ggplot(output_BH, aes(
+  x = factor(K),
+  y = FDP,
+  color = max_null_sim,
+  group = sim_id        # <--- keeps order stable!
+)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max similarity\n(null → true)",
+    title = "FDP vs K (colored by max similarity of null topics--BH)"
+  )
+
+```
+
+```{r}
+ggplot(output_BH, aes(
+  x = mean_null_sim,
+  y = FDP
+)) +
+  geom_point(aes(color = mean_null_sim), size = 3, alpha = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  facet_wrap(~ K, scales = "free") +
+  labs(
+    x = "Mean similarity of null topics to true topics",
+    y = "FDP",
+    color = "Mean similarity",
+    title = "FDP vs null-topic similarity, by K (BH)"
+  )
+
+```
+```{r}
+ggplot(output_BH, aes(
+  x = max_null_sim,
+  y = FDP
+)) +
+  geom_point(aes(color = max_null_sim), size = 3, alpha = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "black") +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  facet_wrap(~ K, scales = "free") +
+  labs(
+    x = "Max similarity of null topics to true topics",
+    y = "FDP",
+    color = "Max similarity",
+    title = "FDP vs null-topic similarity, by K (BH)"
+  )
+
+```
+
+```{r}
+ggplot(output_BH, aes(x = factor(K), y = FDP, color = max_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max topic error",
+    title = "FDP vs K (colored by max topic-model estimation error--BH)"
+  )
+```
+
+
+
+```{r}
+ggplot(output_BH, aes(x = factor(K), y = FDP, color = max_null_sim)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max similarity\n(null → true)",
+    title = "FDP vs K (colored by max similarity of null topics--BH)"
+  )
+```
+```{r}
+ggplot(output_BH, aes(x = factor(K), y = FDP, color = mean_null_sim)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Mean similarity\n(null → true)",
+    title = "FDP vs K (colored by mean similarity of null topics--BH)"
+  )
+```
+
+
+
+```{r}
+output_BH
+```
+
+```{r}
+ggplot(output_BH, aes(
+    x = factor(K),
+    y = FDP,
+    color = mean_null_sim
+)) +
+  geom_jitter(width = 0.15, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max similarity\n(null → true)",
+    title = "FDP vs K (colored by max similarity of null topics)"
+  )
+
+
+```
+
+```{r}
+library(ggplot2)
+
+ggplot(output_BH, aes(
+    x = factor(K),
+    y = FDP,
+    color = max_null_sim
+)) +
+  geom_jitter(width = 0.15, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max similarity\n(null → true)",
+    title = "FDP vs K (colored by max similarity of null topics)"
+  )
+
+
+```
+
+
+```{r}
+ggplot(output_BH, aes(x = median_null_sim, y = FDP)) +
+  geom_point(alpha=0.7) +
+  geom_smooth(method="loess") +
+  theme_bw() +
+  labs(
+    x = "Median similarity of null topics to true DE topics",
+    y = "FDP",
+    title = "How topic similarity affects FDP"
+  )
+
+```
+
+
