@@ -1,1 +1,1 @@
-# Topric Modeling
+# Topic Modeling
