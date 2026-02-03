@@ -1,0 +1,289 @@
+---
+title: "lps5.1"
+output: pdf_document
+date: "2026-01-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model: (pairwise log comparision) with spline time effect
+```{r}
+library(limma)
+library(splines)
+N <- nrow(L_sub)
+K <- ncol(L_sub)
+time_num <- c(
+  d0 = 0, d0.25 = 0.25, d0.5 = 0.5,
+  d1 = 1, d2 = 2, d3 = 3, d5 = 5
+)[as.character(tp)]
+
+stopifnot(!any(is.na(time_num)))
+
+eps <- 1e-8
+pair_mat <- t(combn(K, 2))
+n_pairs <- nrow(pair_mat)
+
+log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+
+for (p in seq_len(n_pairs)) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat[, p] <-
+    log(L_sub[, k1] + eps) -
+    log(L_sub[, k2] + eps)
+}
+
+colnames(log_ratio_mat) <-
+  apply(pair_mat, 1, \(idx) paste0("T", idx[1], "_vs_T", idx[2]))
+
+Y_lr <- t(log_ratio_mat)   # features × samples
+```
+
+```{r}
+df_spline <- 3
+design_s <- model.matrix(
+  ~ 0 + tissue + tissue:ns(time_num, df = df_spline),
+  data = samples_sub
+)
+colnames(design_s) <- make.names(colnames(design_s))
+
+fit_s <- lmFit(Y_lr, design_s)
+fit_s <- eBayes(fit_s)
+
+# test all tissue-specific spline coefficients jointly
+time_cols <- grep("^tissue.*ns\\.", colnames(design_s))
+res_time_pairs <- topTable(fit_s, coef = time_cols, number = Inf, sort.by = "F")
+fit_s$F.p.value 
+```
+
+```{r}
+library(splines)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+plot_pair_spline_by_tissue_sep <- function(k1, k2,
+                                          fit_s,
+                                          samples_sub,
+                                          df_spline = 3,
+                                          t_min = 0, t_max = 5, n_grid = 200,
+                                          palette = "Dark2",
+                                          n_first = 6) {
+  stopifnot(k1 != k2)
+
+  # ---- find the row name for this pair in fit_s ----
+  pair1 <- paste0("T", k1, "_vs_T", k2)
+  pair2 <- paste0("T", k2, "_vs_T", k1)
+
+  rn <- rownames(fit_s$coefficients)
+  if (pair1 %in% rn) {
+    pair_name <- pair1
+    sign_mult <- 1
+  } else if (pair2 %in% rn) {
+    pair_name <- pair2
+    sign_mult <- -1
+  } else {
+    stop("Cannot find this pair in fit_s rownames. Check your pair naming.")
+  }
+
+  # ---- prediction grid across all tissues ----
+  tgrid <- seq(t_min, t_max, length.out = n_grid)
+  tissues <- levels(samples_sub$tissue)
+
+  newdat <- expand.grid(time_num = tgrid, tissue = tissues)
+  newdat$tissue <- factor(newdat$tissue, levels = tissues)
+
+  # IMPORTANT: same formula as fit (Option B)
+  Xnew <- model.matrix(~ 0 + tissue + tissue:ns(time_num, df = df_spline),
+                       data = newdat)
+  colnames(Xnew) <- make.names(colnames(Xnew))
+
+  # align columns with fit
+  common_cols <- intersect(colnames(Xnew), colnames(fit_s$coefficients))
+  Xnew2 <- Xnew[, common_cols, drop = FALSE]
+  B2    <- fit_s$coefficients[, common_cols, drop = FALSE]
+
+  # ---- predict ----
+  pred <- as.numeric(B2[pair_name, , drop = TRUE] %*% t(Xnew2))
+  pred <- sign_mult * pred
+
+  plot_df <- cbind(newdat, log_ratio = pred)
+
+  # ---- split tissues into two sets (6 + 7) ----
+  n_first <- min(n_first, length(tissues))
+  tissues_1 <- tissues[seq_len(n_first)]
+  tissues_2 <- tissues[(n_first + 1):length(tissues)]
+
+  p1 <- ggplot(filter(plot_df, tissue %in% tissues_1),
+               aes(x = time_num, y = log_ratio, color = tissue)) +
+    geom_line(linewidth = 1.1) +
+    theme_minimal(base_size = 12) +
+    scale_color_brewer(palette = palette) +
+    labs(
+      title = paste0("log(T", k1, "/T", k2, ") by tissue (1–", n_first, ")"),
+      x = "Time (days)",
+      y = bquote(log(theta[.(k1)]/theta[.(k2)])),
+      color = "Tissue"
+    )
+
+  p2 <- ggplot(filter(plot_df, tissue %in% tissues_2),
+               aes(x = time_num, y = log_ratio, color = tissue)) +
+    geom_line(linewidth = 1.1) +
+    theme_minimal(base_size = 12) +
+    scale_color_brewer(palette = palette) +
+    labs(
+      title = paste0("log(T", k1, "/T", k2, ") by tissue (", n_first + 1, "–", length(tissues), ")"),
+      x = "Time (days)",
+      y = bquote(log(theta[.(k1)]/theta[.(k2)])),
+      color = "Tissue"
+    )
+
+  list(p1 = p1, p2 = p2, data = plot_df,
+       tissues_1 = tissues_1, tissues_2 = tissues_2)
+}
+
+# example:
+out <- plot_pair_spline_by_tissue_sep(
+  k1 = 14, k2 = 7,
+  fit_s = fit_s,
+  samples_sub = samples_sub,
+  df_spline = 3,
+  n_first = 6
+)
+
+out$p1  # tissues 1–6
+out$p2  # tissues 7–13
+
+```
+
+## Model: spline time effect without tissue (pairwise log comparision)
+```{r}
+design_noT <- model.matrix(~ ns(time_num, df = df_spline), data = samples_sub)
+colnames(design_noT) <- make.names(colnames(design_noT))
+
+fit_noT <- lmFit(Y_lr, design_noT)
+fit_noT <- eBayes(fit_noT)
+
+time_cols_noT <- grep("^ns\\.", colnames(design_noT))
+res_time_pairs_noT <- topTable(fit_noT, coef = time_cols_noT, number = Inf, sort.by = "F")
+
+## 
+
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(splines)
+
+plot_all_vs_ref_noT_sig <- function(t_ref = 7,
+                                   fit_noT,
+                                   res_time_pairs_noT,
+                                   K,
+                                   df_spline = 3,
+                                   t_min = 0, t_max = 5, n_grid = 200,
+                                   ncol = 3,
+                                   alpha = 0.05) {
+
+  # ---- 0) build per-pair BH q-values table from topTable output ----
+  # topTable has rownames = pair names (same as Y_lr rownames), and adj.P.Val = BH by default
+  pair_stats <- data.frame(
+    pair_name = rownames(res_time_pairs_noT),
+    q = res_time_pairs_noT$adj.P.Val,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(sig = q < alpha)
+
+  # ---- 1) prediction grid ----
+  tgrid <- seq(t_min, t_max, length.out = n_grid)
+  newdat <- data.frame(time_num = tgrid)
+
+  Xnew <- model.matrix(~ ns(time_num, df = df_spline), data = newdat)
+  colnames(Xnew) <- make.names(colnames(Xnew))
+
+  common_cols <- intersect(colnames(Xnew), colnames(fit_noT$coefficients))
+  Xnew2 <- Xnew[, common_cols, drop = FALSE]
+  B2    <- fit_noT$coefficients[, common_cols, drop = FALSE]
+  rn <- rownames(B2)
+
+  others <- setdiff(seq_len(K), t_ref)
+
+  pred_list <- lapply(others, function(j) {
+    pair1 <- paste0("T", j, "_vs_T", t_ref)
+    pair2 <- paste0("T", t_ref, "_vs_T", j)
+
+    if (pair1 %in% rn) {
+      pair_name <- pair1; sign_mult <- 1
+    } else if (pair2 %in% rn) {
+      pair_name <- pair2; sign_mult <- -1
+    } else return(NULL)
+
+    pred <- as.numeric(B2[pair_name, , drop = TRUE] %*% t(Xnew2))
+    pred <- sign_mult * pred
+
+    data.frame(
+      time_num = tgrid,
+      log_ratio = pred,
+      pair_name = pair_name,                 # <-- keep canonical rowname
+      pair = paste0("T", j, " vs T", t_ref)   # pretty label
+    )
+  })
+
+  plot_df <- bind_rows(pred_list) %>%
+    left_join(pair_stats, by = "pair_name") %>%
+    mutate(
+      # add star + BH to facet label
+      pair_lab = ifelse(
+        sig,
+        paste0(pair, "  ★  (BH=", signif(q, 2), ")"),
+        paste0(pair, "  (BH=", signif(q, 2), ")")
+      )
+    )
+
+  p <- ggplot(plot_df, aes(x = time_num, y = log_ratio)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    geom_line(aes(alpha = sig), linewidth = 1.0) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.25), guide = "none") +
+    facet_wrap(~ pair_lab, scales = "free_y", ncol = ncol) +
+    theme_minimal(base_size = 12) +
+    labs(
+      title = paste0("Shared spline (no tissue): log(Tj/T", t_ref, ").  ★ = BH<", alpha),
+      x = "Time (days)",
+      y = bquote(log(theta[j]/theta[.(t_ref)]))
+    )
+
+  list(p = p, data = plot_df, pair_stats = pair_stats)
+}
+
+# Example
+out_all_sig <- plot_all_vs_ref_noT_sig(
+  t_ref = 7,
+  fit_noT = fit_noT,
+  res_time_pairs_noT = res_time_pairs_noT,
+  K = K,
+  df_spline = df_spline,
+  ncol = 3,
+  alpha = 0.05
+)
+
+out_all_sig$p
+```
+```{r}
+
+out_all_sig <- plot_all_vs_ref_noT_sig(
+  t_ref = 1,
+  fit_noT = fit_noT,
+  res_time_pairs_noT = res_time_pairs_noT,
+  K = K,
+  df_spline = df_spline,
+  ncol = 3,
+  alpha = 0.05
+)
+
+out_all_sig$p
+```
+
