@@ -1,0 +1,318 @@
+---
+title: "lps6.1"
+output: pdf_document
+date: "2026-01-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model:(logit) spline time effect without tissue
+```{r}
+library(limma)
+library(splines)
+
+df_spline <- 3
+
+time_num <- c(d0=0, d0.25=0.25, d0.5=0.5, d1=1, d2=2, d3=3, d5=5)[as.character(tp)]
+stopifnot(!any(is.na(time_num)))
+
+# Option 2: spline(time) only
+design_noT <- model.matrix(~ ns(time_num, df = df_spline), data = samples_sub)
+colnames(design_noT) <- make.names(colnames(design_noT))
+
+fit_noT <- lmFit(Y, design_noT)
+fit_noT <- eBayes(fit_noT, trend = TRUE)
+
+# joint F-test: "any time effect" (all spline basis terms)
+time_cols <- grep("^ns\\.", colnames(design_noT))
+res_time_noT <- topTable(fit_noT, coef = time_cols, number = Inf, sort.by = "F")
+res_time_noT$topic <- rownames(res_time_noT)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+invlogit <- function(x) 1/(1+exp(-x))
+
+alpha <- 0.05
+sig_topics <- rownames(res_time_noT)[res_time_noT$adj.P.Val < alpha]
+
+tgrid <- seq(0, 5, length.out = 200)
+newdat <- data.frame(time_num = tgrid)
+
+# prediction design must match model (no tissue)
+Xnew <- model.matrix(~ ns(time_num, df = df_spline), data = newdat)
+colnames(Xnew) <- make.names(colnames(Xnew))
+
+# align columns (good practice)
+common_cols <- intersect(colnames(Xnew), colnames(fit_noT$coefficients))
+Xnew2 <- Xnew[, common_cols, drop = FALSE]
+B2    <- fit_noT$coefficients[, common_cols, drop = FALSE]
+
+pred_logit <- B2[sig_topics, , drop = FALSE] %*% t(Xnew2)
+pred_theta <- invlogit(pred_logit)
+
+plot_df <- cbind(newdat, as.data.frame(t(pred_theta)))
+
+plot_long <- plot_df %>%
+  pivot_longer(cols = all_of(sig_topics), names_to = "topic", values_to = "theta_hat")
+
+```
+
+```{r}
+all_topics <- rownames(fit_noT$coefficients)   # e.g. T1..T14 (matches Y rownames)
+
+pred_logit_all <- B2[all_topics, , drop = FALSE] %*% t(Xnew2)
+pred_theta_all <- invlogit(pred_logit_all)
+
+plot_df_all <- cbind(newdat, as.data.frame(t(pred_theta_all)))
+plot_long_all <- plot_df_all %>%
+  pivot_longer(cols = all_of(all_topics), names_to = "topic", values_to = "theta_hat") %>%
+  mutate(sig = topic %in% sig_topics)
+ggplot(plot_long_all, aes(x = time_num, y = theta_hat)) +
+  geom_line(aes(color = sig, linewidth = sig)) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "grey60"),
+                     name = paste0("FDR < ", alpha)) +
+  scale_linewidth_manual(values = c(`TRUE` = 1.3, `FALSE` = 0.7),
+                         guide = "none") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Spline trajectories",
+    x = "Time (days)",
+    y = "Estimated topic proportion (topic vs rest)"
+  )
+```
+
+```{r}
+## plot log odds differences
+# predict on logit scale for all topics
+pred_logit_all <- B2[all_topics, , drop = FALSE] %*% t(Xnew2)   # topics x grid
+
+# choose baseline time t0 (e.g. d0 = 0 days)
+t0 <- 0
+i0 <- which.min(abs(tgrid - t0))
+
+# delta logit vs baseline: "logFC-like" curve
+delta_logit_all <- pred_logit_all - pred_logit_all[, i0]
+
+# long df for ggplot
+plot_df_delta <- cbind(time_num = tgrid, as.data.frame(t(delta_logit_all)))
+plot_long_delta <- plot_df_delta %>%
+  pivot_longer(cols = all_of(all_topics), names_to = "topic", values_to = "delta_logit") %>%
+  mutate(sig = topic %in% sig_topics)
+
+ggplot(plot_long_delta, aes(x = time_num, y = delta_logit)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(aes(color = sig, linewidth = sig)) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_color_manual(values = c(`TRUE`="red", `FALSE`="grey60"),
+                     name = paste0("FDR < ", alpha)) +
+  scale_linewidth_manual(values = c(`TRUE`=1.3, `FALSE`=0.7), guide = "none") +
+  theme_minimal(base_size = 12) +
+  labs(
+    title = "Spline time effect on logit scale (Δ log-odds vs d0)",
+    x = "Time (days)",
+    y = "Δ logit(topic vs rest) relative to d0"
+  )
+```
+# Model: (logit) spline time effect with tissue
+
+```{r}
+library(limma)
+library(splines)
+
+df_spline <- 3
+
+time_num <- c(d0=0, d0.25=0.25, d0.5=0.5, d1=1, d2=2, d3=3, d5=5)[as.character(tp)]
+stopifnot(!any(is.na(time_num)))
+
+design_B <- model.matrix(
+  ~ 0 + tissue + tissue:ns(time_num, df = df_spline),
+  data = samples_sub
+)
+colnames(design_B) <- make.names(colnames(design_B))
+
+fit_B <- lmFit(Y, design_B)
+fit_B <- eBayes(fit_B, trend = TRUE)
+
+# test: any time variation in any tissue (joint F-test over all tissue-specific spline terms)
+time_cols <- grep("^tissue.*ns\\.", colnames(design_B))
+res_time_B <- topTable(fit_B, coef = time_cols, number = Inf, sort.by = "F")
+res_time_B$topic <- rownames(res_time_B)
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+invlogit <- function(x) 1/(1+exp(-x))
+
+alpha <- 0.05
+sig_topics <- rownames(res_time_B)[res_time_B$adj.P.Val < alpha]
+
+tgrid   <- seq(0, 5, length.out = 200)
+tissues <- levels(samples_sub$tissue)
+
+newdat <- expand.grid(time_num = tgrid, tissue = tissues)
+newdat$tissue <- factor(newdat$tissue, levels = tissues)
+
+# IMPORTANT: prediction design must match Model B
+Xnew <- model.matrix(
+  ~ 0 + tissue + tissue:ns(time_num, df = df_spline),
+  data = newdat
+)
+colnames(Xnew) <- make.names(colnames(Xnew))
+
+# align columns (important safety step)
+common_cols <- intersect(colnames(Xnew), colnames(fit_B$coefficients))
+Xnew2 <- Xnew[, common_cols, drop = FALSE]
+B2    <- fit_B$coefficients[, common_cols, drop = FALSE]
+
+# predict logits -> proportions
+pred_logit <- B2[sig_topics, , drop = FALSE] %*% t(Xnew2)
+pred_theta <- invlogit(pred_logit)
+
+plot_df <- cbind(newdat, as.data.frame(t(pred_theta)))
+
+plot_long <- plot_df %>%
+  pivot_longer(cols = all_of(sig_topics), names_to = "topic", values_to = "theta_hat")
+
+```
+
+```{r}
+tissues_all <- levels(samples_sub$tissue)
+tissues_1 <- tissues_all[1:6]
+tissues_2 <- tissues_all[7:length(tissues_all)]
+
+p1 <- ggplot(subset(plot_long, tissue %in% tissues_1),
+             aes(x = time_num, y = theta_hat, color = tissue)) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Model B: tissue-specific spline trajectories (Tissues 1–6)",
+    x = "Time (days)",
+    y = "Estimated topic proportion (topic vs rest)",
+    color = "Tissue"
+  )
+
+p2 <- ggplot(subset(plot_long, tissue %in% tissues_2),
+             aes(x = time_num, y = theta_hat, color = tissue)) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Model B: tissue-specific spline trajectories (Tissues 7–13)",
+    x = "Time (days)",
+    y = "Estimated topic proportion (topic vs rest)",
+    color = "Tissue"
+  )
+
+p1
+p2
+```
+
+```{r}
+pred_theta <- invlogit(pred_logit)
+plot_df_logit <- cbind(newdat, as.data.frame(t(pred_logit)))
+plot_df_prob  <- cbind(newdat, as.data.frame(t(pred_theta)))
+
+plot_long_logit <- plot_df_logit %>%
+  pivot_longer(cols = all_of(sig_topics),
+               names_to = "topic",
+               values_to = "eta_hat")   # linear predictor
+
+plot_long_prob <- plot_df_prob %>%
+  pivot_longer(cols = all_of(sig_topics),
+               names_to = "topic",
+               values_to = "theta_hat")
+tissues_all <- levels(samples_sub$tissue)
+tissues_1 <- tissues_all[1:6]
+tissues_2 <- tissues_all[7:length(tissues_all)]
+
+p1_logit <- ggplot(
+  subset(plot_long_logit, tissue %in% tissues_1),
+  aes(x = time_num, y = eta_hat, color = tissue)
+) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Model B: tissue-specific spline trajectories (logit scale, tissues 1–6)",
+    x = "Time (days)",
+    y = "Logit(topic vs rest)",
+    color = "Tissue"
+  )
+
+p1_logit
+p2_logit <- ggplot(
+  subset(plot_long_logit, tissue %in% tissues_2),
+  aes(x = time_num, y = eta_hat, color = tissue)
+) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title = "Model B: tissue-specific spline trajectories (logit scale, tissues 7–13)",
+    x = "Time (days)",
+    y = "Logit(topic vs rest)",
+    color = "Tissue"
+  )
+
+p2_logit
+```
+```{r}
+library(ggplot2)
+
+# --- split tissues into two sets ---
+tissues_all <- levels(samples_sub$tissue)
+tissues_1 <- tissues_all[1:6]
+tissues_2 <- tissues_all[7:length(tissues_all)]
+
+# --- split topics into two sets of 7 ---
+topics_all <- sort(unique(plot_long$topic))
+topics_1 <- topics_all[1:7]
+topics_2 <- topics_all[8:14]
+
+# helper to plot one panel set
+plot_tissue_topic <- function(tissues_keep, topics_keep, title_txt) {
+  df <- subset(plot_long, tissue %in% tissues_keep & topic %in% topics_keep)
+
+  df$topic  <- factor(df$topic, levels = topics_keep)
+  df$tissue <- factor(df$tissue, levels = tissues_keep)
+
+  ggplot(df, aes(x = time_num, y = theta_hat, color = topic)) +
+    geom_line(linewidth = 1.1, alpha = 0.9) +
+    facet_wrap(~ tissue, scales = "free_y") +
+    theme_minimal(base_size = 12) +
+    scale_color_brewer(palette = "Set2") +
+    labs(
+      title = title_txt,
+      x = "Time (days)",
+      y = "Estimated topic proportion",
+      color = "Topic"
+    )
+}
+
+p11 <- plot_tissue_topic(tissues_1, topics_1, "Tissues 1–6 | Topics 1–7")
+p12 <- plot_tissue_topic(tissues_1, topics_2, "Tissues 1–6 | Topics 8–14")
+p21 <- plot_tissue_topic(tissues_2, topics_1, "Tissues 7–13 | Topics 1–7")
+p22 <- plot_tissue_topic(tissues_2, topics_2, "Tissues 7–13 | Topics 8–14")
+
+p11
+p12
+p21
+p22
+```
+
