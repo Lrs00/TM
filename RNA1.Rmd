@@ -11,7 +11,7 @@ library(dplyr)
 library(tidyr)
 ```
 
-
+## read cancer dataset
 ```{r}
 rna_df <- read.csv("rna_for_seurat.csv", check.names = FALSE)
 # Drop the first 6 metadata columns
