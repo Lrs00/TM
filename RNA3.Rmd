@@ -1,0 +1,726 @@
+---
+title: "RNA3"
+output: pdf_document
+date: "2026-02-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+library(ggplot2)
+
+```
+
+## pairwise log comparision
+
+
+```{r}
+theta <- fit_multinom$L
+stopifnot(nrow(theta) == nrow(df))
+N <- nrow(theta); K <- ncol(theta)
+
+c0 <- 1e-4
+med_k <- colMedians(theta, na.rm = TRUE)
+eps_k <- c0 * med_k
+
+# guardrails
+eps_k <- pmin(pmax(eps_k, 1e-12), 1e-2)
+
+theta01 <- pmin(pmax(theta, 0), 1)
+
+# log(theta + eps_k) with sweep
+log_theta <- log(sweep(theta01, 2, eps_k, FUN = "+"))   # N x K
+
+```
+
+```{r}
+df <- droplevels(meta_balanced)
+df$treatment  <- droplevels(factor(df$treatment))
+df$dosage     <- droplevels(factor(df$dosage))
+df$time       <- droplevels(factor(df$time))
+df$cell_state <- droplevels(factor(df$cell_state, levels=c("G1","S","G2","M","APOP")))
+
+df$cond_cs <- interaction(df$treatment, df$dosage, df$time, df$cell_state,
+                          sep = "_", drop = TRUE)
+
+df$cond_cs <- relevel(df$cond_cs, ref = "WT_0_0_G1")
+
+design_cs <- model.matrix(~ cond_cs, data = df)
+colnames(design_cs) <- make.names(colnames(design_cs))
+stopifnot(limma::is.fullrank(design_cs))
+
+```
+
+## Build pairwise features
+```{r}
+pair_mat <- t(combn(K, 2))      # n_pairs x 2
+n_pairs <- nrow(pair_mat)
+
+log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+for (p in seq_len(n_pairs)) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat[, p] <- log_theta[, k1] - log_theta[, k2]
+}
+
+colnames(log_ratio_mat) <- apply(pair_mat, 1, function(idx) {
+  paste0("T", idx[1], "_vs_T", idx[2])
+})
+
+Y_lr <- t(log_ratio_mat)        # features x samples
+dim(Y_lr)
+dim(design_cs)
+```
+
+```{r}
+fit_lr <- lmFit(Y_lr, design_cs)
+fit_lr <- eBayes(fit_lr, robust = TRUE)
+
+# coefficients of interest (all cond_cs levels except intercept)
+coef_names <- colnames(fit_lr$coefficients)
+cond_cs_coefs <- grep("^cond_cs", coef_names, value = TRUE)
+cond_cs_coefs
+
+```
+
+```{r}
+res_pairs_all
+```
+
+```{r}
+res_pairs_all <- do.call(rbind, lapply(cond_cs_coefs, function(cf) {
+  tt <- topTable(fit_lr, coef = cf, number = Inf, sort.by = "none")
+  tt$coef <- cf
+  tt$pair <- rownames(tt)          # correct feature id
+  tt
+}))
+
+rownames(res_pairs_all) <- NULL    # IMPORTANT: drop mangled rownames
+
+parse_pairs <- function(pair_vec) {
+  parts <- do.call(rbind, strsplit(pair_vec, "_vs_"))
+  k1 <- as.integer(sub("^T", "", parts[,1]))
+  k2 <- as.integer(sub("^T", "", parts[,2]))
+  data.frame(pair = pair_vec, k1 = k1, k2 = k2)
+}
+
+# pair_info <- parse_pairs(unique(res_pairs_all$pair))
+pair_info <- parse_pairs(rownames(Y_lr))
+
+# optional sanity check
+stopifnot(!any(is.na(pair_info$k1)), !any(is.na(pair_info$k2)))
+res_pairs_all
+```
+
+```{r}
+res_long <- res_pairs_all %>%
+  left_join(pair_info, by = "pair") %>%
+  select(coef, pair, logFC, adj.P.Val, P.Value, k1, k2)
+
+
+# expand each pair into two directed rows: (topic=k1, other=k2) and (topic=k2, other=k1)
+res_directed <- bind_rows(
+  res_long %>% transmute(coef, pair, topic = k1, other = k2,
+                         beta =  logFC, q = adj.P.Val, p = P.Value),
+  res_long %>% transmute(coef, pair, topic = k2, other = k1,
+                         beta = -logFC, q = adj.P.Val, p = P.Value)
+)
+
+res_long 
+```
+## Least extreme effect size 
+```{r}
+alpha <- 0.05
+
+least_extreme <- res_directed %>%
+  group_by(coef, topic) %>%
+  summarise(
+    # Least-extreme EFFECT size: min_{other} |beta|
+    S = min(abs(beta), na.rm = TRUE),
+
+    # "Worst" q-value across comparisons (strict "all significant" check)
+    Q_worst = max(q, na.rm = TRUE),
+
+    # Fraction of pairwise comparisons significant for this topic
+    frac_sig = mean(q < alpha, na.rm = TRUE),
+
+    # Which other topic achieved the minimum |beta| (helpful for interpretation)
+    other_min = other[which.min(abs(beta))][1],
+    beta_min  = beta[which.min(abs(beta))][1],
+    .groups = "drop"
+  ) %>%
+  mutate(topic = paste0("T", topic),
+         other_min = paste0("T", other_min))
+
+```
+
+```{r}
+# plot_le <- least_extreme %>%
+#   mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+#   separate(coef_raw, into = c("treatment","dosage","time","cell_state"),
+#            sep = "_", remove = FALSE, fill = "right") %>%
+#   mutate(
+#     time = as.numeric(time),
+#     dosage = factor(dosage),
+#     cell_state = factor(cell_state, levels=c("G1","S","G2","M","APOP"))
+#   )
+
+plot_le <- least_extreme %>%
+  mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+  separate(coef_raw, into = c("treatment","dosage","time","cell_state"),
+           sep = "_", remove = FALSE, fill = "right") %>%
+  mutate(
+    time = as.numeric(time),
+    dosage = factor(dosage),
+    cell_state = factor(cell_state, levels=c("G1","S","G2","M","APOP"))
+  ) %>%
+  filter(treatment != "WT")   # <-- exclude WT
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# helper to extract topic index
+plot_le2 <- plot_le %>%
+  mutate(topic_id = as.integer(sub("^T", "", topic)))
+
+make_plot_block <- function(lo, hi) {
+  ggplot(
+    plot_le2 %>% filter(topic_id >= lo, topic_id <= hi),
+    aes(x = time, y = S, color = treatment, linetype = dosage)
+  ) +
+    geom_line() +
+    facet_grid(cell_state ~ topic, scales = "free_y") +
+    scale_x_log10() +
+    theme_bw() +
+    labs(
+      x = "Time",
+      y = "Least-extreme |beta| = min over other topics",
+      title = paste0("Topic distinctness over time (T", lo, "–T", hi, ")")
+    )
+}
+
+p1 <- make_plot_block(1, 8)
+p2 <- make_plot_block(9, 16)
+
+p1
+p2
+# High S ⇒ topic k changes relative to every other topic (strong “topic distinctness” signal).
+
+#Topic 15 is most distinct from all other topics under osimertinib (30) at time 100 in G1, but its distinctness diminishes over time
+```
+## fraction significant
+```{r}
+library(dplyr)
+
+res_long2 <- res_long %>%
+  group_by(coef) %>%
+  mutate(q_pair = p.adjust(P.Value, method = "BH")) %>%
+  ungroup()
+res_long2
+```
+
+
+```{r}
+res_directed <- bind_rows(
+  res_long2 %>% transmute(coef, pair, topic = k1, other = k2,
+                          beta =  logFC, p = P.Value, q = q_pair),
+  res_long2 %>% transmute(coef, pair, topic = k2, other = k1,
+                          beta = -logFC, p = P.Value, q = q_pair)
+)
+res_directed 
+alpha <- 0.05
+
+topic_summary <- res_directed %>%
+  group_by(coef, topic) %>%
+  summarise(
+    n_total  = sum(!is.na(q)),
+    n_sig    = sum(q < alpha, na.rm = TRUE),
+    frac_sig = n_sig / n_total,
+
+    # optional: least-extreme effect size
+    S        = min(abs(beta), na.rm = TRUE),
+    other_min = other[which.min(abs(beta))][1],
+    beta_min  = beta[which.min(abs(beta))][1],
+
+    # optional: strict "all significant" style summary
+    Q_worst  = max(q, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic = paste0("T", topic),
+    other_min = paste0("T", other_min)
+  )
+topic_summary 
+```
+```{r}
+hits_50 <- topic_summary %>% filter(frac_sig >= 0.5)
+hits_50
+```
+```{r}
+hits_combo <- topic_summary %>%
+  filter(frac_sig >= 0.8, S >= 0.5)   # choose S threshold based on what’s meaningful
+hits_combo
+```
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+plot_df2 <- topic_summary %>%
+  mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+  separate(coef_raw, into = c("treatment","dosage","time","cell_state"),
+           sep = "_", remove = FALSE, fill = "right") %>%
+  mutate(
+    time = factor(time, levels = sort(unique(as.numeric(time)))),
+    dosage = factor(dosage, levels = c("10","20","30")),   # adjust if needed
+    cell_state = factor(cell_state, levels = c("G1","S","G2","M","APOP"))
+  ) %>%
+  filter(treatment != "WT")
+
+base_plot <- function(dat, ttl) {
+  ggplot(dat, aes(x = time, y = topic, fill = frac_sig)) +
+    geom_tile() +
+    facet_grid(cell_state ~ treatment + dosage, scales = "free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x  = element_text(size = 8, angle = 45, hjust = 1),
+      axis.title.x = element_text(size = 9),
+      axis.title.y = element_text(size = 9),
+      strip.text.y = element_text(size = 8),
+      strip.text.x = element_text(size = 7)
+    ) +
+    labs(
+      x = "Time",
+      y = "Topic",
+      fill = "Fraction\nsignificant",
+      title = ttl
+    )
+}
+
+p_G1S <- base_plot(filter(plot_df2, cell_state %in% c("G1","S")),
+                   "Fraction significant (G1, S)")
+
+p_G2M <- base_plot(filter(plot_df2, cell_state %in% c("G2","M")),
+                   "Fraction significant (G2, M)")
+
+p_APOP <- base_plot(filter(plot_df2, cell_state %in% c("APOP")),
+                    "Fraction significant (APOP)")
+
+p_G1S
+p_G2M
+p_APOP
+
+```
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+plot_df2 <- topic_summary %>%
+  mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+  separate(coef_raw, into = c("treatment","dosage","time","cell_state"),
+           sep = "_", remove = FALSE, fill = "right") %>%
+  mutate(
+    time = factor(time, levels = sort(unique(as.numeric(time)))),
+    dosage = factor(dosage, levels = c("10","20","30")),   # adjust if needed
+    cell_state = factor(cell_state, levels = c("G1","S","G2","M","APOP"))
+  ) %>%
+  filter(treatment != "WT")
+
+base_plot <- function(dat, ttl) {
+  ggplot(dat, aes(x = time, y = topic, fill = S)) +
+    geom_tile() +
+    facet_grid(cell_state ~ treatment + dosage, scales = "free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x  = element_text(size = 8, angle = 45, hjust = 1),
+      axis.title.x = element_text(size = 9),
+      axis.title.y = element_text(size = 9),
+      strip.text.y = element_text(size = 8),
+      strip.text.x = element_text(size = 7)
+    ) +
+    labs(
+      x = "Time",
+      y = "Topic",
+      fill = "Least-extreme\n|beta|",
+      title = ttl
+    )
+}
+
+p_G1S <- base_plot(filter(plot_df2, cell_state %in% c("G1","S")),
+                   "Topic distinctness (least-extreme effect size) (G1, S)")
+
+p_G2M <- base_plot(filter(plot_df2, cell_state %in% c("G2","M")),
+                   "Topic distinctness (least-extreme effect size) (G2, M)")
+
+p_APOP <- base_plot(filter(plot_df2, cell_state %in% c("APOP")),
+                    "Topic distinctness (least-extreme effect size) (APOP)")
+
+p_G1S
+p_G2M
+p_APOP
+```
+```{r}
+topic_summary
+```
+
+
+
+
+```{r}
+ggplot(plot_df2, aes(x = frac_sig, y = S, label = topic)) +
+  geom_point(alpha = 0.8) +
+  facet_grid(cell_state ~ treatment) +
+  theme_bw() +
+  labs(
+    x = "Fraction significant",
+    y = "Least-extreme |beta|",
+    title = "Topics that are both broadly significant and strongly distinct"
+  )
+
+```
+```{r}
+trt <- "Osimertinib"   # or "Gefitinib"
+d<-"10"
+ggplot(filter(plot_df2, treatment == trt,dosage == d),
+       aes(x = frac_sig, y = S, label = topic)) +
+  geom_point(alpha = 0.8,size = 1.1) +
+  facet_grid(cell_state ~ time) +
+  theme_bw() +
+  labs(
+    x = "Fraction significant",
+    y = "Least-extreme |beta|",
+    title = paste0("Topics: broadly significant & distinct — ", trt)
+  )
+
+```
+```{r}
+library(ggrepel)
+trt <- "Osimertinib"
+d <- "10"
+
+pdat <- filter(plot_df2, treatment == trt, dosage == d)
+
+ggplot(pdat, aes(x = frac_sig, y = S)) +
+  geom_point(alpha = 0.8, size = 1.1) +
+  # label "top-right" (tune thresholds)
+  geom_text_repel(
+    data = subset(pdat, frac_sig >= 0.6 & S >= quantile(S, 0.85, na.rm = TRUE)),
+    aes(label = topic),
+    size = 3,
+    max.overlaps = 50
+  ) +
+  facet_grid(cell_state ~ time) +
+  theme_bw() +
+  labs(
+    x = "Fraction significant",
+    y = "Least-extreme |beta|",
+    title = paste0("Topics: broadly significant & distinct — ", trt, " (dose ", d, ")")
+  )
+
+```
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+trt <- "Osimertinib"
+doses <- c("10","20","30")
+
+for (d in doses) {
+  pdat <- filter(plot_df2, treatment == trt, dosage == d)
+
+  p <- ggplot(pdat, aes(x = frac_sig, y = S)) +
+    geom_point(alpha = 0.8, size = 1.1) +
+    geom_text_repel(
+      data = subset(pdat, frac_sig >= 0.6 & S >= quantile(S, 0.85, na.rm = TRUE)),
+      aes(label = topic),
+      size = 3,
+      max.overlaps = 50
+    ) +
+    facet_grid(cell_state ~ time) +
+    theme_bw() +
+    labs(
+      x = "Fraction significant",
+      y = "Least-extreme |beta|",
+      title = paste0("Topics: broadly significant & distinct — ", trt, " (dose ", d, ")")
+    )
+
+  print(p)
+}
+
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+trt <- "Gefitnib"
+doses <- c("10","20","30")
+
+for (d in doses) {
+  pdat <- filter(plot_df2, treatment == trt, dosage == d)
+
+  p <- ggplot(pdat, aes(x = frac_sig, y = S)) +
+    geom_point(alpha = 0.8, size = 1.1) +
+    geom_text_repel(
+      data = subset(pdat, frac_sig >= 0.6 & S >= quantile(S, 0.85, na.rm = TRUE)),
+      aes(label = topic),
+      size = 3,
+      max.overlaps = 50
+    ) +
+    facet_grid(cell_state ~ time) +
+    theme_bw() +
+    labs(
+      x = "Fraction significant",
+      y = "Least-extreme |beta|",
+      title = paste0("Topics: broadly significant & distinct — ", trt, " (dose ", d, ")")
+    )
+
+  print(p)
+}
+
+```
+
+## plot beta
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+alpha <- 0.05
+topic_k <- 15
+
+plot_t3 <- res_directed %>%
+  filter(topic == topic_k, other != topic_k) %>%
+  mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+  separate(coef_raw, into = c("treatment","dosage","time","cell_state"),
+           sep = "_", remove = FALSE, fill = "right") %>%
+  mutate(
+    time = as.numeric(time),
+    dosage = factor(dosage),
+    cell_state = factor(cell_state, levels=c("G1","S","G2","M","APOP")),
+    other_id = other,                              # keep numeric other for filtering
+    other = paste0("T", other),                    # make label
+    other = factor(other, levels = paste0("T", setdiff(1:K, topic_k))),
+    topic = paste0("T", topic_k),
+    sig = q < alpha
+  ) %>%
+  filter(treatment != "WT")
+
+make_t3_plot <- function(dat, ttl) {
+  ggplot(dat, aes(x = time, y = beta,
+                  group = interaction(treatment, dosage),
+                  color = treatment, linetype = dosage)) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    geom_line(linewidth = 0.7) +
+    geom_point(aes(shape = sig), size = 1.8) +
+    scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16)) +
+    facet_grid(cell_state ~ other, scales = "free_y") +
+    scale_x_log10(breaks = c(5, 10, 30, 240, 1440)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      strip.text.x = element_text(size = 7),
+      strip.text.y = element_text(size = 8)
+    ) +
+    labs(
+      x = "Time",
+      y = expression(beta[c]~~"for"~~log(theta[T3]+epsilon[3]) - log(theta[other]+epsilon[other])),
+      shape = "BH < 0.05",
+      title = ttl
+    )
+}
+
+# Plot 1: others in T1–T8 (excluding T3)
+p_1_8 <- make_t3_plot(
+  filter(plot_t3, other_id %in% 1:8),
+  "T3 vs other topics (T1–T8)"
+)
+
+# Plot 2: others in T9–T16
+p_9_16 <- make_t3_plot(
+  filter(plot_t3, other_id %in% 9:16),
+  "T3 vs other topics (T9–T16)"
+)
+
+p_1_8
+p_9_16
+
+```
+```{r}
+make_t3_plot_logx <- function(dat, ttl) {
+  ggplot(dat, aes(x = time, y = beta,
+                  group = interaction(treatment, dosage),
+                  color = treatment, linetype = dosage)) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    geom_line(linewidth = 0.7) +
+    geom_point(aes(shape = sig), size = 1.8) +
+    scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16)) +
+    facet_grid(cell_state ~ other, scales = "free_y") +
+    scale_x_log10(breaks = c(5, 10, 30, 240, 1440)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      strip.text.x = element_text(size = 7),
+      strip.text.y = element_text(size = 8)
+    ) +
+    labs(
+      x = "Time (log10 scale)",
+      y = expression(beta[c]~~"for"~~log(theta[T3]+epsilon[3]) - log(theta[other]+epsilon[other])),
+      shape = "BH < 0.05",
+      title = ttl
+    )
+}
+
+p_1_8_log <- make_t3_plot_logx(filter(plot_t3, other_id %in% 1:8),
+                              "T15 vs other topics (T1–T8) — log-scale time")
+
+p_9_16_log <- make_t3_plot_logx(filter(plot_t3, other_id %in% 9:16),
+                               "T15 vs other topics (T9–T16) — log-scale time")
+
+p_1_8_log
+p_9_16_log
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+alpha <- 0.05
+topic_k <- 3
+
+plot_t3 <- res_directed %>%
+  filter(topic == topic_k, other != topic_k) %>%
+  mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+  separate(coef_raw, into = c("treatment","dosage","time","cell_state"),
+           sep = "_", remove = FALSE, fill = "right") %>%
+  mutate(
+    time_num = as.numeric(time),
+    time_f = factor(time_num, levels = sort(unique(time_num))),  # <-- discrete ordered
+    dosage = factor(dosage),
+    cell_state = factor(cell_state, levels=c("G1","S","G2","M","APOP")),
+    other_id = other,
+    other = paste0("T", other),
+    other = factor(other, levels = paste0("T", setdiff(1:K, topic_k))),
+    topic = paste0("T", topic_k),
+    sig = q < alpha
+  ) %>%
+  filter(treatment != "WT")
+
+make_t3_plot <- function(dat, ttl) {
+  ggplot(dat, aes(x = time_f, y = beta,
+                  group = interaction(treatment, dosage),
+                  color = treatment, linetype = dosage)) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    geom_line(linewidth = 0.7) +
+    geom_point(aes(shape = sig), size = 1.8) +
+    scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16)) +
+    facet_grid(cell_state ~ other, scales = "free_y") +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      strip.text.x = element_text(size = 7),
+      strip.text.y = element_text(size = 8)
+    ) +
+    labs(
+      x = "Time",
+      y = expression(beta[c]~~"for"~~log(theta[T3]+epsilon[3]) - log(theta[other]+epsilon[other])),
+      shape = "BH < 0.05",
+      title = ttl
+    )
+}
+
+p_1_8 <- make_t3_plot(filter(plot_t3, other_id %in% 1:8),
+                      "T3 vs other topics (T1–T8)")
+
+p_9_16 <- make_t3_plot(filter(plot_t3, other_id %in% 9:16),
+                       "T3 vs other topics (T9–T16)")
+
+p_1_8
+p_9_16
+
+
+
+```
+## check assumption
+```{r}
+set.seed(1)
+idx <- sample(seq_len(nrow(Y_lr)), 12)   # 12 random pairs
+par(mfrow=c(3,4))
+for (j in idx) hist(Y_lr[j,], main=rownames(Y_lr)[j], xlab="log-ratio", breaks=50)
+par(mfrow=c(1,1))
+
+```
+```{r}
+set.seed(4)
+idx <- sample(seq_len(nrow(Y_lr)), 12)   # 12 random pairs
+par(mfrow=c(3,4))
+for (j in idx) hist(Y_lr[j,], main=rownames(Y_lr)[j], xlab="log-ratio", breaks=50)
+par(mfrow=c(1,1))
+```
+
+```{r}
+m <- rowMeans(Y_lr)
+v <- matrixStats::rowVars(Y_lr)
+
+plot(m, v, pch=16, cex=0.4, xlab="feature mean", ylab="feature variance")
+
+```
+```{r}
+R <- residuals.MArrayLM(fit_lr, y = Y_lr)   # features x samples
+dim(R)
+Mu <- fitted.MArrayLM(fit_lr, y = Y_lr)     # features x samples
+library(matrixStats)
+
+R  <- residuals.MArrayLM(fit_lr, y = Y_lr)
+Mu <- fitted.MArrayLM(fit_lr, y = Y_lr)
+
+# 1) QQ plot for a few random features
+set.seed(1)
+feat_idx <- sample(seq_len(nrow(Y_lr)), 9)
+
+# par(mfrow=c(3,3), mar=c(3,3,2,1))
+for (j in feat_idx) {
+  qqnorm(R[j, ], main=rownames(Y_lr)[j], cex=0.5)
+  qqline(R[j, ], col="red")
+}
+par(mfrow=c(1,1))
+
+# 2) residual variance vs fitted mean (feature-level)
+m <- rowMeans(Mu)
+v <- rowVars(R)
+
+plot(m, v, pch=16, cex=0.35,
+     xlab="feature mean(fitted)", ylab="feature var(residual)")
+
+# 3) sample-level residual SD (spot outlier samples)
+sample_rsd <- apply(R, 2, sd, na.rm=TRUE)
+plot(sample_rsd, pch=16, cex=0.6,
+     xlab="sample index", ylab="residual SD across features")
+abline(h=quantile(sample_rsd, 0.99), lty=2, col="red")
+
+
+```
+
+
