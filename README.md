@@ -12,5 +12,5 @@
 - `RNA3.2`: Log pairwise analysis with cell state
 - `RNA5.1`: Log pairwise analysis without cell state
 - `RNA6.2`: Comparison of limma, ASH, and non-EB methods for log pairwise analysis
-- 'GomDE_Cancer1': GoMDE analysis
+- `GomDE_Cancer1`: GoMDE analysis
 
