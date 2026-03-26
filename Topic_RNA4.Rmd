@@ -1,0 +1,439 @@
+---
+title: "Topic_RNA4"
+output: pdf_document
+date: "2026-03-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Matrix)
+library(fastTopics)
+library(proxy)
+library(clue)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+
+## Select the optimal number of topics
+```{r}
+# ============================================================
+# Split-half topic reproducibility with matched/off-diagonal summaries
+# ============================================================
+
+# Optional: build gene_mat if not already in memory
+# rna_df <- read.csv("rna_for_seurat.csv", check.names = FALSE)
+# gene_mat <- data.matrix(rna_df[, -(1:6)])
+
+stopifnot(is.matrix(gene_mat))
+stopifnot(is.numeric(gene_mat))
+stopifnot(!anyNA(gene_mat))
+stopifnot(all(is.finite(gene_mat)))
+stopifnot(min(gene_mat, na.rm = TRUE) >= 0)
+
+one_split_metrics <- function(gene_mat, k, subset_size = 10000, numiter = 50,
+                              seed_split = 1, seed_fit = 1,
+                              similarity_mode = c("cosine", "cosine_log_topic_eps"),
+                              eps_sim = 1e-12) {
+  similarity_mode <- match.arg(similarity_mode)
+
+  stopifnot(2 * subset_size <= nrow(gene_mat))
+
+  set.seed(seed_split)
+  all_idx <- sample.int(nrow(gene_mat), 2 * subset_size)
+  idx1 <- all_idx[1:subset_size]
+  idx2 <- all_idx[(subset_size + 1):(2 * subset_size)]
+
+  mat1 <- gene_mat[idx1, , drop = FALSE]
+  mat2 <- gene_mat[idx2, , drop = FALSE]
+
+  mat1 <- mat1[rowSums(mat1) > 0, , drop = FALSE]
+  mat2 <- mat2[rowSums(mat2) > 0, , drop = FALSE]
+
+  mat1_sp <- Matrix(mat1, sparse = TRUE)
+  mat2_sp <- Matrix(mat2, sparse = TRUE)
+
+  set.seed(seed_fit)
+  fit1 <- fit_poisson_nmf(mat1_sp, k = k, numiter = numiter, verbose = "none",
+                          control = list(extrapolate = TRUE))
+  fit2 <- fit_poisson_nmf(mat2_sp, k = k, numiter = numiter, verbose = "none",
+                          control = list(extrapolate = TRUE))
+
+  fit1 <- poisson2multinom(fit1)
+  fit2 <- poisson2multinom(fit2)
+
+  beta1 <- fit1$F
+  beta2 <- fit2$F
+
+  if (similarity_mode == "cosine") {
+    X1 <- beta1
+    X2 <- beta2
+  } else {
+    c0 <- 1e-4
+    eps_min <- 1e-12
+    eps_max <- 1e-2
+
+    med1 <- apply(beta1, 2, median, na.rm = TRUE)
+    med2 <- apply(beta2, 2, median, na.rm = TRUE)
+
+    eps1_k <- pmin(pmax(c0 * med1, eps_min), eps_max)
+    eps2_k <- pmin(pmax(c0 * med2, eps_min), eps_max)
+
+    X1 <- log(sweep(beta1, 2, eps1_k, FUN = "+"))
+    X2 <- log(sweep(beta2, 2, eps2_k, FUN = "+"))
+  }
+
+  sim_mat <- as.matrix(proxy::simil(t(X1), t(X2), method = "cosine"))
+  assignment <- clue::solve_LSAP(sim_mat, maximum = TRUE)
+  sim_reord <- sim_mat[, assignment, drop = FALSE]
+
+  diag_vals <- diag(sim_reord)
+  off_vals  <- sim_reord[row(sim_reord) != col(sim_reord)]
+
+  nearest_wrong <- sapply(seq_len(k), function(i) max(sim_reord[i, -i, drop = TRUE]))
+
+  data.frame(
+    similarity_mode = similarity_mode,
+    S_match = mean(diag_vals),
+    S_off = mean(off_vals),
+    gap = mean(diag_vals) - mean(off_vals),
+    ratio = mean(diag_vals) / mean(off_vals),
+    mean_margin = mean(diag_vals - nearest_wrong)
+  )
+}
+
+score_for_K <- function(gene_mat, K, B = 20, subset_size = 10000, numiter = 50,
+                        base_seed_split = 1000, base_seed_fit = 5000,
+                        similarity_mode = c("cosine", "cosine_log_topic_eps"),
+                        eps_sim = 1e-12, verbose = TRUE) {
+  similarity_mode <- match.arg(similarity_mode)
+
+  metrics_list <- vector("list", B)
+
+  for (b in seq_len(B)) {
+    mb <- one_split_metrics(
+      gene_mat,
+      k = K,
+      subset_size = subset_size,
+      numiter = numiter,
+      seed_split = base_seed_split + 1000 * K + b,
+      seed_fit   = base_seed_fit   + 1000 * K + b,
+      similarity_mode = similarity_mode,
+      eps_sim = eps_sim
+    )
+
+    mb$K <- K
+    mb$split <- b
+    metrics_list[[b]] <- mb
+
+    if (verbose) {
+      cat("mode =", similarity_mode,
+          " K =", K,
+          " b =", b,
+          " S_match =", round(mb$S_match, 4),
+          " S_off =", round(mb$S_off, 4),
+          " gap =", round(mb$gap, 4),
+          " ratio =", round(mb$ratio, 4),
+          " margin =", round(mb$mean_margin, 4), "\n")
+    }
+  }
+
+  metrics_df <- bind_rows(metrics_list)
+
+  summarise_metric <- function(x) {
+    m  <- mean(x)
+    sd <- stats::sd(x)
+    se <- sd / sqrt(length(x))
+    c(mean = m, sd = sd, ci95_lo = m - 1.96 * se, ci95_hi = m + 1.96 * se)
+  }
+
+  sm_match  <- summarise_metric(metrics_df$S_match)
+  sm_off    <- summarise_metric(metrics_df$S_off)
+  sm_gap    <- summarise_metric(metrics_df$gap)
+  sm_ratio  <- summarise_metric(metrics_df$ratio)
+  sm_margin <- summarise_metric(metrics_df$mean_margin)
+
+  summary_df <- data.frame(
+    K = K,
+    B = B,
+    similarity_mode = similarity_mode,
+
+    S_match_mean = sm_match["mean"],
+    S_match_ci95_lo = sm_match["ci95_lo"],
+    S_match_ci95_hi = sm_match["ci95_hi"],
+
+    S_off_mean = sm_off["mean"],
+    S_off_ci95_lo = sm_off["ci95_lo"],
+    S_off_ci95_hi = sm_off["ci95_hi"],
+
+    gap_mean = sm_gap["mean"],
+    gap_ci95_lo = sm_gap["ci95_lo"],
+    gap_ci95_hi = sm_gap["ci95_hi"],
+
+    ratio_mean = sm_ratio["mean"],
+    ratio_ci95_lo = sm_ratio["ci95_lo"],
+    ratio_ci95_hi = sm_ratio["ci95_hi"],
+
+    mean_margin_mean = sm_margin["mean"],
+    mean_margin_ci95_lo = sm_margin["ci95_lo"],
+    mean_margin_ci95_hi = sm_margin["ci95_hi"]
+  )
+
+  list(summary = summary_df, splits = metrics_df)
+}
+```
+
+
+```{r}
+# ============================================================
+# Run across K and similarity modes
+# ============================================================
+Ks <- c(2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42)
+B <- 20
+subset_size <- 10000
+numiter <- 45
+modes <- c("cosine", "cosine_log_topic_eps")
+
+all_summaries <- list()
+all_splits <- list()
+
+for (mode in modes) {
+  for (K in Ks) {
+    out <- score_for_K(
+      gene_mat,
+      K = K,
+      B = B,
+      subset_size = subset_size,
+      numiter = numiter,
+      similarity_mode = mode,
+      eps_sim = 1e-12,
+      verbose = TRUE
+    )
+
+    key <- paste(mode, K, sep = "_")
+    all_summaries[[key]] <- out$summary
+    all_splits[[key]] <- out$splits
+  }
+}
+
+summary_df <- bind_rows(all_summaries)
+splits_df  <- bind_rows(all_splits)
+write.csv(summary_df, "summary_df_reproducibility.csv", row.names = FALSE)
+write.csv(splits_df,  "splits_df_reproducibility.csv",  row.names = FALSE)
+```
+
+```{r}
+B <- 20
+summary_df <- read.csv("summary_df_reproducibility.csv")
+splits_df  <- read.csv("splits_df_reproducibility.csv")
+```
+
+
+
+```{r}
+# ============================================================
+# Helper: keep the same jitter + line + CI + point style
+# ============================================================
+plot_metric_all_methods <- function(summary_df, splits_df, metric, B,
+                                    ylab, title_text) {
+  mean_col <- paste0(metric, "_mean")
+  lo_col   <- paste0(metric, "_ci95_lo")
+  hi_col   <- paste0(metric, "_ci95_hi")
+
+  ggplot() +
+    geom_jitter(
+      data = splits_df,
+      aes(x = factor(K), y = .data[[metric]], color = similarity_mode),
+      width = 0.16, height = 0, alpha = 0.45, size = 1.1
+    ) +
+    geom_line(
+      data = summary_df,
+      aes(x = factor(K), y = .data[[mean_col]],
+          color = similarity_mode, group = similarity_mode),
+      linewidth = 0.6,
+      position = position_dodge(width = 0.35)
+    ) +
+    geom_errorbar(
+      data = summary_df,
+      aes(x = factor(K), ymin = .data[[lo_col]], ymax = .data[[hi_col]],
+          color = similarity_mode),
+      width = 0.2, linewidth = 0.6,
+      position = position_dodge(width = 0.35)
+    ) +
+    geom_point(
+      data = summary_df,
+      aes(x = factor(K), y = .data[[mean_col]], color = similarity_mode),
+      size = 2.2,
+      position = position_dodge(width = 0.35)
+    ) +
+    theme_bw() +
+    labs(
+      x = "Number of topics (K)",
+      y = ylab,
+      color = "Similarity metric",
+      title = paste0(title_text, " (B = ", B, ")")
+    )
+}
+
+plot_metric_one_method <- function(summary_df, splits_df, method_keep, metric, B,
+                                   ylab, title_text) {
+  mean_col <- paste0(metric, "_mean")
+  lo_col   <- paste0(metric, "_ci95_lo")
+  hi_col   <- paste0(metric, "_ci95_hi")
+
+  summary_df_sub <- summary_df %>%
+    dplyr::filter(similarity_mode == method_keep)
+
+  splits_df_sub <- splits_df %>%
+    dplyr::filter(similarity_mode == method_keep)
+
+  ggplot() +
+    geom_jitter(
+      data = splits_df_sub,
+      aes(x = factor(K), y = .data[[metric]]),
+      width = 0.16, height = 0, alpha = 0.45, size = 1.1
+    ) +
+    geom_line(
+      data = summary_df_sub,
+      aes(x = factor(K), y = .data[[mean_col]], group = 1),
+      linewidth = 0.6
+    ) +
+    geom_errorbar(
+      data = summary_df_sub,
+      aes(x = factor(K), ymin = .data[[lo_col]], ymax = .data[[hi_col]]),
+      width = 0.2, linewidth = 0.6
+    ) +
+    geom_point(
+      data = summary_df_sub,
+      aes(x = factor(K), y = .data[[mean_col]]),
+      size = 2.2
+    ) +
+    theme_bw() +
+    labs(
+      x = "Number of topics (K)",
+      y = ylab,
+      title = paste0(title_text, " — ", method_keep, " (B = ", B, ")")
+    )
+}
+```
+
+
+```{r}
+# ============================================================
+# Plot block 1: all methods together
+# ============================================================
+plot_metric_all_methods(
+  summary_df, splits_df,
+  metric = "S_match",
+  B = B,
+  ylab = "Matched similarity (S_match)",
+  title_text = "Matched topic similarity with 95% CI"
+)
+
+plot_metric_all_methods(
+  summary_df, splits_df,
+  metric = "S_off",
+  B = B,
+  ylab = "Off-diagonal similarity (S_off)",
+  title_text = "Off-diagonal (wrong-topic) similarity with 95% CI"
+)
+
+plot_metric_all_methods(
+  summary_df, splits_df,
+  metric = "ratio",
+  B = B,
+  ylab = "Ratio = S_match / S_off",
+  title_text = "Matched-vs-off-diagonal separation ratio with 95% CI"
+)
+
+plot_metric_all_methods(
+  summary_df, splits_df,
+  metric = "gap",
+  B = B,
+  ylab = "Gap = S_match - S_off",
+  title_text = "Matched-vs-off-diagonal separation gap with 95% CI"
+)
+```
+
+
+```{r}
+# ============================================================
+# Plot block 2: cosine_log_topic_eps only
+# ============================================================
+method_keep <- "cosine_log_topic_eps"
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "S_match",
+  B = B,
+  ylab = "Matched similarity (S_match)",
+  title_text = "Matched topic similarity with 95% CI"
+)
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "S_off",
+  B = B,
+  ylab = "Off-diagonal similarity (S_off)",
+  title_text = "Off-diagonal similarity with 95% CI"
+)
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "ratio",
+  B = B,
+  ylab = "Ratio = S_match / S_off",
+  title_text = "Separation ratio with 95% CI"
+)
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "gap",
+  B = B,
+  ylab = "Gap = S_match - S_off",
+  title_text = "Separation gap with 95% CI"
+)
+```
+
+
+```{r}
+# ============================================================
+# Plot block 3: cosine only
+# ============================================================
+method_keep <- "cosine"
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "S_match",
+  B = B,
+  ylab = "Matched similarity (S_match)",
+  title_text = "Matched topic similarity with 95% CI"
+)
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "S_off",
+  B = B,
+  ylab = "Off-diagonal similarity (S_off)",
+  title_text = "Off-diagonal similarity with 95% CI"
+)
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "ratio",
+  B = B,
+  ylab = "Ratio = S_match / S_off",
+  title_text = "Separation ratio with 95% CI"
+)
+
+plot_metric_one_method(
+  summary_df, splits_df, method_keep,
+  metric = "gap",
+  B = B,
+  ylab = "Gap = S_match - S_off",
+  title_text = "Separation gap with 95% CI"
+)
+```
+
