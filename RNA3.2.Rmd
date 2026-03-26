@@ -1,0 +1,485 @@
+---
+title: "RNA3.2"
+output: pdf_document
+date: "2026-03-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(limma)
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+library(ggplot2)
+library(stringr)
+```
+
+## pairwise log comparision: treatment*dosage*time*cell_state
+### 1. preprocessing
+```{r}
+alpha <- 0.05
+topics_per_plot <- 4
+
+# metadata
+df <- droplevels(meta_balanced) %>%
+  mutate(
+    treatment  = droplevels(factor(treatment)),
+    dosage     = droplevels(factor(dosage)),
+    time       = droplevels(factor(time)),
+    cell_state = droplevels(factor(cell_state, levels = c("G1","S","G2","M","APOP")))
+  )
+
+# topic proportions
+theta <- fit_multinom$L
+stopifnot(nrow(theta) == nrow(df))
+
+N <- nrow(theta)
+K <- ncol(theta)
+
+# topic-specific epsilon
+c0 <- 1e-4
+eps_k <- c0 * colMedians(theta, na.rm = TRUE)
+eps_k <- pmin(pmax(eps_k, 1e-12), 1e-2)
+
+theta01   <- pmin(pmax(theta, 0), 1)
+log_theta <- log(sweep(theta01, 2, eps_k, FUN = "+"))
+
+# combined condition
+df$cond_cs <- interaction(
+  df$treatment, df$dosage, df$time, df$cell_state,
+  sep = "_", drop = TRUE
+)
+df$cond_cs <- relevel(df$cond_cs, ref = "WT_0_0_G1")
+
+design_cs <- model.matrix(~ cond_cs, data = df)
+colnames(design_cs) <- make.names(colnames(design_cs))
+stopifnot(limma::is.fullrank(design_cs))
+```
+
+
+---
+
+### 2. Build pairwise features and fit once
+
+
+```{r}
+parse_pairs <- function(pair_vec) {
+  parts <- do.call(rbind, strsplit(pair_vec, "_vs_"))
+  tibble(
+    pair = pair_vec,
+    k1 = as.integer(sub("^T", "", parts[, 1])),
+    k2 = as.integer(sub("^T", "", parts[, 2]))
+  )
+}
+
+build_pairwise_results <- function(log_theta, design, robust = TRUE) {
+  K <- ncol(log_theta)
+  pair_mat <- t(combn(K, 2))
+  n_pairs  <- nrow(pair_mat)
+
+  log_ratio_mat <- matrix(NA_real_, nrow = nrow(log_theta), ncol = n_pairs)
+  for (p in seq_len(n_pairs)) {
+    k1 <- pair_mat[p, 1]
+    k2 <- pair_mat[p, 2]
+    log_ratio_mat[, p] <- log_theta[, k1] - log_theta[, k2]
+  }
+
+  colnames(log_ratio_mat) <- apply(pair_mat, 1, function(idx) {
+    paste0("T", idx[1], "_vs_T", idx[2])
+  })
+
+  Y_lr <- t(log_ratio_mat)
+
+  fit_lr <- lmFit(Y_lr, design)
+  fit_lr <- eBayes(fit_lr, robust = robust)
+
+  coef_names <- colnames(fit_lr$coefficients)
+  cond_cs_coefs <- grep("^cond_cs", coef_names, value = TRUE)
+
+  res_pairs_all <- bind_rows(lapply(cond_cs_coefs, function(cf) {
+    tt <- topTable(fit_lr, coef = cf, number = Inf, sort.by = "none")
+    tt$coef <- cf
+    tt$pair <- rownames(tt)
+    tt
+  }))
+
+  pair_info <- parse_pairs(rownames(Y_lr))
+
+  res_long <- res_pairs_all %>%
+    left_join(pair_info, by = "pair") %>%
+    select(coef, pair, logFC, adj.P.Val, P.Value, k1, k2)
+
+  res_directed <- bind_rows(
+    res_long %>% transmute(coef, pair, topic = k1, other = k2,
+                           beta =  logFC, q = adj.P.Val, p = P.Value),
+    res_long %>% transmute(coef, pair, topic = k2, other = k1,
+                           beta = -logFC, q = adj.P.Val, p = P.Value)
+  )
+
+  list(
+    Y_lr = Y_lr,
+    fit_lr = fit_lr,
+    cond_cs_coefs = cond_cs_coefs,
+    res_pairs_all = res_pairs_all,
+    res_long = res_long,
+    res_directed = res_directed
+  )
+}
+
+pw <- build_pairwise_results(log_theta, design_cs, robust = TRUE)
+res_long <- pw$res_long
+res_directed <- pw$res_directed
+```
+
+
+---
+
+### 3. Helpers for coefficient parsing
+
+
+```{r}
+parse_coef_fields <- function(dat) {
+  dat %>%
+    mutate(coef_raw = sub("^cond_cs", "", coef)) %>%
+    separate(
+      coef_raw,
+      into = c("treatment", "dosage", "time", "cell_state"),
+      sep = "_",
+      remove = FALSE,
+      fill = "right"
+    ) %>%
+    mutate(
+      dosage = factor(dosage, levels = c("10", "20", "30")),
+      time = as.numeric(time),
+      cell_state = factor(cell_state, levels = c("G1","S","G2","M","APOP"))
+    )
+}
+```
+
+
+---
+
+### 4. Least-extreme summary
+
+
+```{r}
+least_extreme <- res_directed %>%
+  group_by(coef, topic) %>%
+  summarise(
+    S = min(abs(beta), na.rm = TRUE),
+    Q_worst = max(q, na.rm = TRUE),
+    frac_sig = mean(q < alpha, na.rm = TRUE),
+    other_min = other[which.min(abs(beta))][1],
+    beta_min = beta[which.min(abs(beta))][1],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic = paste0("T", topic),
+    other_min = paste0("T", other_min)
+  )
+
+plot_le <- least_extreme %>%
+  parse_coef_fields() %>%
+  filter(treatment != "WT") %>%
+  mutate(topic_id = as.integer(sub("^T", "", topic)))
+  
+```
+
+
+#### Line plots for least-extreme effect size
+
+
+```{r}
+make_topic_block_plot <- function(dat, yvar, ylab, ttl_prefix, lo, hi) {
+  ggplot(
+    dat %>% filter(topic_id >= lo, topic_id <= hi),
+    aes(x = time, y = .data[[yvar]], color = treatment, linetype = dosage)
+  ) +
+    geom_line() +
+    facet_grid(cell_state ~ topic, scales = "free_y") +
+    scale_x_log10() +
+    theme_bw() +
+    labs(
+      x = "Time",
+      y = ylab,
+      title = paste0(ttl_prefix, " (T", lo, "–T", hi, ")")
+    )
+}
+
+p1 <- make_topic_block_plot(
+  plot_le, "S",
+  "Least-extreme |beta| = min over other topics",
+  "Topic distinctness over time", 1, 8
+)
+
+p2 <- make_topic_block_plot(
+  plot_le, "S",
+  "Least-extreme |beta| = min over other topics",
+  "Topic distinctness over time", 9, 16
+)
+
+p1
+p2
+
+```
+
+
+
+#### Heatmaps for fraction significant and least-extreme effect
+```{r}
+topic_summary <- res_directed %>%
+  group_by(coef, topic) %>%
+  summarise(
+    n_total = sum(!is.na(q)),
+    n_sig = sum(q < alpha, na.rm = TRUE),
+    frac_sig = n_sig / n_total,
+    S = min(abs(beta), na.rm = TRUE),
+    other_min = other[which.min(abs(beta))][1],
+    beta_min = beta[which.min(abs(beta))][1],
+    Q_worst = max(q, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic = paste0("T", topic),
+    other_min = paste0("T", other_min)
+  )
+
+plot_df2 <- topic_summary %>%
+  parse_coef_fields() %>%
+  mutate(
+    time = factor(time, levels = sort(unique(time)))
+  ) %>%
+  filter(treatment != "WT")
+
+base_topic_heatmap <- function(dat, fill_var, fill_lab, ttl) {
+  ggplot(dat, aes(x = time, y = topic, fill = .data[[fill_var]])) +
+    geom_tile() +
+    facet_grid(cell_state ~ treatment + dosage, scales = "free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x  = element_text(size = 8, angle = 45, hjust = 1),
+      axis.title.x = element_text(size = 9),
+      axis.title.y = element_text(size = 9),
+      strip.text.y = element_text(size = 8),
+      strip.text.x = element_text(size = 7)
+    ) +
+    labs(x = "Time", y = "Topic", fill = fill_lab, title = ttl)
+}
+
+p_G1S_frac <- base_topic_heatmap(
+  filter(plot_df2, cell_state %in% c("G1","S")),
+  "frac_sig", "Fraction\nsignificant", "Fraction significant (G1, S)"
+)
+
+p_G2M_frac <- base_topic_heatmap(
+  filter(plot_df2, cell_state %in% c("G2","M")),
+  "frac_sig", "Fraction\nsignificant", "Fraction significant (G2, M)"
+)
+
+p_APOP_frac <- base_topic_heatmap(
+  filter(plot_df2, cell_state == "APOP"),
+  "frac_sig", "Fraction\nsignificant", "Fraction significant (APOP)"
+)
+
+p_G1S_S <- base_topic_heatmap(
+  filter(plot_df2, cell_state %in% c("G1","S")),
+  "S", "Least-extreme\n|beta|", "Topic distinctness (G1, S)"
+)
+
+p_G2M_S <- base_topic_heatmap(
+  filter(plot_df2, cell_state %in% c("G2","M")),
+  "S", "Least-extreme\n|beta|", "Topic distinctness (G2, M)"
+)
+
+p_APOP_S <- base_topic_heatmap(
+  filter(plot_df2, cell_state == "APOP"),
+  "S", "Least-extreme\n|beta|", "Topic distinctness (APOP)"
+)
+
+p_G1S_frac
+p_G2M_frac
+p_APOP_frac
+
+p_G1S_S
+p_G2M_S
+p_APOP_S
+```
+
+
+---
+
+### 5. Pairwise beta plot for one topic
+
+```{r}
+topic_k <- 15
+
+plot_topic_beta <- res_directed %>%
+  filter(topic == topic_k, other != topic_k) %>%
+  parse_coef_fields() %>%
+  mutate(
+    other_id = other,
+    other = paste0("T", other),
+    other = factor(other, levels = paste0("T", setdiff(seq_len(K), topic_k))),
+    topic = paste0("T", topic_k),
+    sig = q < alpha
+  ) %>%
+  filter(treatment != "WT")
+
+make_beta_plot <- function(dat, ttl) {
+  ggplot(
+    dat,
+    aes(x = time, y = beta,
+        group = interaction(treatment, dosage),
+        color = treatment, linetype = dosage)
+  ) +
+    geom_hline(yintercept = 0, linewidth = 0.3) +
+    geom_line(linewidth = 0.7) +
+    geom_point(aes(shape = sig), size = 1.8) +
+    scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16)) +
+    facet_grid(cell_state ~ other, scales = "free_y") +
+    scale_x_log10(breaks = c(5, 10, 30, 240, 1440)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      strip.text.x = element_text(size = 7),
+      strip.text.y = element_text(size = 8)
+    ) +
+    labs(
+      x = "Time",
+      y = expression(beta[c]),
+      shape = "BH < 0.05",
+      title = ttl
+    )
+}
+
+p_1_8 <- make_beta_plot(
+  filter(plot_topic_beta, other_id %in% 1:8),
+  "T15 vs other topics (T1–T8)"
+)
+
+p_9_16 <- make_beta_plot(
+  filter(plot_topic_beta, other_id %in% 9:16),
+  "T15 vs other topics (T9–T16)"
+)
+
+p_1_8
+p_9_16
+```
+
+
+---
+
+### 6. Most-extreme summary
+
+
+```{r}
+most_extreme <- res_directed %>%
+  group_by(coef, topic) %>%
+  summarise(
+    S_max = max(abs(beta), na.rm = TRUE),
+    Q_best = min(q, na.rm = TRUE),
+    frac_sig = mean(q < alpha, na.rm = TRUE),
+    other_max = other[which.max(abs(beta))][1],
+    beta_max = beta[which.max(abs(beta))][1],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic = paste0("T", topic),
+    other_max = paste0("T", other_max)
+  )
+
+plot_me <- most_extreme %>%
+  parse_coef_fields() %>%
+  filter(treatment != "WT") %>%
+  mutate(topic_id = as.integer(sub("^T", "", topic)))
+```
+
+
+#### Line plots for most-extreme effect size
+
+```{r}
+p1_max <- make_topic_block_plot(
+  plot_me, "S_max",
+  "Most-extreme |beta| = max over other topics",
+  "Topic extreme-contrast over time", 1, 8
+)
+
+p2_max <- make_topic_block_plot(
+  plot_me, "S_max",
+  "Most-extreme |beta| = max over other topics",
+  "Topic extreme-contrast over time", 9, 16
+)
+
+p1_max
+p2_max
+```
+
+
+#### Heatmaps for signed and absolute most-extreme effects
+
+```{r}
+plot_df_max <- most_extreme %>%
+  parse_coef_fields() %>%
+  mutate(
+    time = factor(time, levels = sort(unique(time)))
+  ) %>%
+  filter(treatment != "WT")
+
+base_beta_max_heatmap <- function(dat, fill_var, fill_lab, ttl, signed = FALSE) {
+  p <- ggplot(dat, aes(x = time, y = topic, fill = .data[[fill_var]])) +
+    geom_tile() +
+    facet_grid(cell_state ~ treatment + dosage, scales = "free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x  = element_text(size = 8, angle = 45, hjust = 1),
+      axis.title.x = element_text(size = 9),
+      axis.title.y = element_text(size = 9),
+      strip.text.y = element_text(size = 8),
+      strip.text.x = element_text(size = 7)
+    ) +
+    labs(x = "Time", y = "Topic", fill = fill_lab, title = ttl)
+
+  if (signed) {
+    p <- p + scale_fill_gradient2(name = fill_lab, midpoint = 0)
+  }
+  p
+}
+
+p_G1S_beta <- base_beta_max_heatmap(
+  filter(plot_df_max, cell_state %in% c("G1","S")),
+  "beta_max", "beta_max\n(signed)", "Most-extreme signed effect (G1, S)", TRUE
+)
+
+p_G2M_beta <- base_beta_max_heatmap(
+  filter(plot_df_max, cell_state %in% c("G2","M")),
+  "beta_max", "beta_max\n(signed)", "Most-extreme signed effect (G2, M)", TRUE
+)
+
+p_APOP_beta <- base_beta_max_heatmap(
+  filter(plot_df_max, cell_state == "APOP"),
+  "beta_max", "beta_max\n(signed)", "Most-extreme signed effect (APOP)", TRUE
+)
+
+p_G1S_mag <- base_beta_max_heatmap(
+  filter(plot_df_max, cell_state %in% c("G1","S")),
+  "S_max", "Most extreme\n|beta|", "Topic extreme-contrast magnitude (G1, S)"
+)
+
+p_G2M_mag <- base_beta_max_heatmap(
+  filter(plot_df_max, cell_state %in% c("G2","M")),
+  "S_max", "Most extreme\n|beta|", "Topic extreme-contrast magnitude (G2, M)"
+)
+
+p_APOP_mag <- base_beta_max_heatmap(
+  filter(plot_df_max, cell_state == "APOP"),
+  "S_max", "Most extreme\n|beta|", "Topic extreme-contrast magnitude (APOP)"
+)
+
+p_G1S_beta
+p_G2M_beta
+p_APOP_beta
+
+p_G1S_mag
+p_G2M_mag
+p_APOP_mag
+```
