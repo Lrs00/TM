@@ -364,7 +364,7 @@ ggplot(plot_df, aes(x = time, y = logFC, group = topic)) +
   )
 ```
 
-## Model: remove cell state (logit)
+## Model: remove tissue (logit)
 
 ```{r}
 library(limma)
