@@ -1,0 +1,347 @@
+---
+title: "RNA5.1"
+output: pdf_document
+date: "2026-03-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(limma)
+library(dplyr)
+library(tidyr)
+library(matrixStats)
+library(ggplot2)
+library(stringr)
+```
+
+
+## pairwise log comparision: treatment*dosage*time
+
+```{r}
+alpha <- 0.05
+c0 <- 1e-4
+K <- ncol(fit_multinom$L)
+
+# --- topic proportions and stable log transform ---
+theta <- fit_multinom$L
+stopifnot(nrow(theta) == nrow(meta_balanced))
+
+eps_k <- c0 * colMedians(theta, na.rm = TRUE)
+eps_k <- pmin(pmax(eps_k, 1e-12), 1e-2)
+
+theta01 <- pmin(pmax(theta, 0), 1)
+log_theta <- log(sweep(theta01, 2, eps_k, FUN = "+"))
+
+# --- metadata / design ---
+df_nocs <- droplevels(meta_balanced) %>%
+  mutate(
+    treatment = droplevels(factor(treatment)),
+    dosage    = droplevels(factor(dosage)),
+    time      = droplevels(factor(time))
+  )
+
+df_nocs$cond <- interaction(df_nocs$treatment, df_nocs$dosage, df_nocs$time,
+                            sep = "_", drop = TRUE)
+df_nocs$cond <- relevel(df_nocs$cond, ref = "WT_0_0")
+
+design_nocs <- model.matrix(~ cond, data = df_nocs)
+colnames(design_nocs) <- make.names(colnames(design_nocs))
+stopifnot(limma::is.fullrank(design_nocs))
+```
+
+
+## Build pairwise features and fit model
+
+```{r}
+parse_pairs <- function(pair_vec) {
+  parts <- do.call(rbind, strsplit(pair_vec, "_vs_"))
+  tibble(
+    pair = pair_vec,
+    k1 = as.integer(sub("^T", "", parts[, 1])),
+    k2 = as.integer(sub("^T", "", parts[, 2]))
+  )
+}
+
+build_pairwise_results <- function(log_theta, design, coef_pattern = "^cond", robust = TRUE) {
+  K <- ncol(log_theta)
+  pair_mat <- t(combn(K, 2))
+  n_pairs <- nrow(pair_mat)
+
+  log_ratio_mat <- matrix(NA_real_, nrow = nrow(log_theta), ncol = n_pairs)
+  for (p in seq_len(n_pairs)) {
+    k1 <- pair_mat[p, 1]
+    k2 <- pair_mat[p, 2]
+    log_ratio_mat[, p] <- log_theta[, k1] - log_theta[, k2]
+  }
+
+  colnames(log_ratio_mat) <- apply(pair_mat, 1, function(idx) {
+    paste0("T", idx[1], "_vs_T", idx[2])
+  })
+
+  Y_lr <- t(log_ratio_mat)
+
+  fit_lr <- lmFit(Y_lr, design)
+  fit_lr <- eBayes(fit_lr, robust = robust)
+
+  coef_names <- colnames(fit_lr$coefficients)
+  target_coefs <- grep(coef_pattern, coef_names, value = TRUE)
+
+  res_pairs_all <- bind_rows(lapply(target_coefs, function(cf) {
+    tt <- topTable(fit_lr, coef = cf, number = Inf, sort.by = "none")
+    tt$coef <- cf
+    tt$pair <- rownames(tt)
+    tt
+  }))
+
+  pair_info <- parse_pairs(rownames(Y_lr))
+
+  res_long <- res_pairs_all %>%
+    left_join(pair_info, by = "pair") %>%
+    select(coef, pair, logFC, adj.P.Val, P.Value, k1, k2)
+
+  res_directed <- bind_rows(
+    res_long %>% transmute(coef, pair, topic = k1, other = k2,
+                           beta =  logFC, q = adj.P.Val, p = P.Value),
+    res_long %>% transmute(coef, pair, topic = k2, other = k1,
+                           beta = -logFC, q = adj.P.Val, p = P.Value)
+  )
+
+  list(
+    Y_lr = Y_lr,
+    fit_lr = fit_lr,
+    res_pairs_all = res_pairs_all,
+    res_long = res_long,
+    res_directed = res_directed
+  )
+}
+
+pw_nocs <- build_pairwise_results(log_theta, design_nocs, coef_pattern = "^cond", robust = TRUE)
+
+res_long_nocs <- pw_nocs$res_long
+res_directed_nocs <- pw_nocs$res_directed
+
+```
+
+
+
+## Topic-level summaries
+
+```{r}
+topic_summary_nocs <- res_directed_nocs %>%
+  group_by(coef, topic) %>%
+  summarise(
+    n_total  = sum(!is.na(q)),
+    n_sig    = sum(q < alpha, na.rm = TRUE),
+    frac_sig = n_sig / n_total,
+    S        = min(abs(beta), na.rm = TRUE),
+    other_min = other[which.min(abs(beta))][1],
+    beta_min  = beta[which.min(abs(beta))][1],
+    Q_worst   = max(q, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic = paste0("T", topic),
+    other_min = paste0("T", other_min)
+  )
+
+topic_summary_max_nocs <- res_directed_nocs %>%
+  group_by(coef, topic) %>%
+  summarise(
+    n_total  = sum(!is.na(q)),
+    n_sig    = sum(q < alpha, na.rm = TRUE),
+    frac_sig = n_sig / n_total,
+    S_max    = max(abs(beta), na.rm = TRUE),
+    other_max = other[which.max(abs(beta))][1],
+    beta_max  = beta[which.max(abs(beta))][1],
+    Q_best   = min(q, na.rm = TRUE),
+    Q_worst  = max(q, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic = paste0("T", topic),
+    other_max = paste0("T", other_max)
+  )
+```
+
+
+## Parse coefficients for plotting
+
+```{r}
+parse_cond_fields <- function(dat) {
+  dat %>%
+    mutate(coef_raw = sub("^cond", "", coef)) %>%
+    separate(coef_raw, into = c("treatment","dosage","time"),
+             sep = "_", remove = FALSE, fill = "right") %>%
+    mutate(
+      dosage = factor(dosage, levels = c("10","20","30")),
+      time_num = as.numeric(time),
+      time = factor(time, levels = sort(unique(as.numeric(time))))
+    )
+}
+
+plot_df_nocs <- topic_summary_nocs %>%
+  parse_cond_fields() %>%
+  filter(treatment != "WT") %>%
+  mutate(topic_id = as.integer(sub("^T", "", topic)))
+
+plot_df_max_nocs <- topic_summary_max_nocs %>%
+  parse_cond_fields() %>%
+  filter(treatment != "WT") %>%
+  mutate(topic_id = as.integer(sub("^T", "", topic)))
+```
+
+
+## Heatmaps
+
+```{r}
+plot_topic_heatmap <- function(dat, fill_var, fill_lab, ttl) {
+  ggplot(dat, aes(x = time, y = topic, fill = .data[[fill_var]])) +
+    geom_tile() +
+    facet_grid(dosage ~ treatment, scales = "free_x") +
+    theme_bw() +
+    theme(
+      axis.text.x  = element_text(size = 8, angle = 45, hjust = 1),
+      strip.text.y = element_text(size = 8),
+      strip.text.x = element_text(size = 8)
+    ) +
+    labs(x = "Time", y = "Topic", fill = fill_lab, title = ttl)
+}
+
+p_frac_nocs <- plot_topic_heatmap(
+  plot_df_nocs, "frac_sig", "Fraction\nsignificant",
+  "Fraction significant (no cell_state in design)"
+)
+
+p_S_nocs <- plot_topic_heatmap(
+  plot_df_nocs, "S", "Least-extreme\n|beta|",
+  "Topic distinctness S = min|beta| (no cell_state in design)"
+)
+
+p_Smax_nocs <- plot_topic_heatmap(
+  plot_df_max_nocs, "S_max", "Most-extreme\n|beta|",
+  "Topic strongest contrast S_max = max|beta| (no cell_state in design)"
+)
+
+p_frac_nocs
+p_S_nocs
+p_Smax_nocs
+```
+
+
+## Line plots by topic blocks
+
+```{r}
+make_topic_block_plot <- function(dat, yvar, ylab, ttl, lo, hi) {
+  ggplot(
+    dat %>% filter(topic_id >= lo, topic_id <= hi),
+    aes(x = time_num, y = .data[[yvar]],
+        color = treatment, linetype = dosage,
+        group = interaction(treatment, dosage))
+  ) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 1.3) +
+    facet_wrap(~ topic, scales = "free_y", ncol = 4) +
+    scale_x_log10(breaks = c(5, 10, 30, 240, 1440)) +
+    theme_bw() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      strip.text  = element_text(size = 8)
+    ) +
+    labs(x = "Time (log scale)", y = ylab, title = ttl)
+}
+
+p1_nocs_logx <- make_topic_block_plot(
+  plot_df_nocs, "S",
+  "Least-extreme |beta| = min over other topics",
+  "Topic distinctness over time (no cell_state) — T1–T8", 1, 8
+)
+
+p2_nocs_logx <- make_topic_block_plot(
+  plot_df_nocs, "S",
+  "Least-extreme |beta| = min over other topics",
+  "Topic distinctness over time (no cell_state) — T9–T16", 9, 16
+)
+
+p1_max_nocs_logx <- make_topic_block_plot(
+  plot_df_max_nocs, "S_max",
+  "Most-extreme |beta| = max over other topics",
+  "Most-extreme topic contrast over time (no cell_state) — T1–T8", 1, 8
+)
+
+p2_max_nocs_logx <- make_topic_block_plot(
+  plot_df_max_nocs, "S_max",
+  "Most-extreme |beta| = max over other topics",
+  "Most-extreme topic contrast over time (no cell_state) — T9–T16", 9, 16
+)
+
+p1_nocs_logx
+p2_nocs_logx
+p1_max_nocs_logx
+p2_max_nocs_logx
+```
+
+
+## Beta trajectory for one topic
+
+```{r}
+make_tk_plot_nocs <- function(res_directed, topic_k, alpha = 0.05, K = 16) {
+  plot_tk <- res_directed %>%
+    filter(topic == topic_k, other != topic_k) %>%
+    mutate(coef_raw = sub("^cond", "", coef)) %>%
+    separate(coef_raw, into = c("treatment","dosage","time"),
+             sep = "_", remove = FALSE, fill = "right") %>%
+    mutate(
+      time = as.numeric(time),
+      dosage = factor(dosage, levels = c("10","20","30")),
+      other_id = other,
+      other = paste0("T", other),
+      other = factor(other, levels = paste0("T", setdiff(seq_len(K), topic_k))),
+      sig = q < alpha
+    ) %>%
+    filter(treatment != "WT")
+
+  make_panel <- function(dat, ttl) {
+    ggplot(dat, aes(x = time, y = beta,
+                    group = interaction(treatment, dosage),
+                    color = treatment, linetype = dosage)) +
+      geom_hline(yintercept = 0, linewidth = 0.3) +
+      geom_line(linewidth = 0.7) +
+      geom_point(aes(shape = sig), size = 1.8) +
+      scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16)) +
+      facet_wrap(~ other, scales = "free_y", ncol = 4) +
+      scale_x_log10(breaks = c(5, 10, 30, 240, 1440)) +
+      theme_bw() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        strip.text  = element_text(size = 7)
+      ) +
+      labs(
+        x = "Time",
+        y = "beta",
+        shape = "BH < 0.05",
+        title = ttl
+      )
+  }
+
+  list(
+    p_1_8 = make_panel(
+      filter(plot_tk, other_id %in% 1:8),
+      paste0("T", topic_k, " vs other topics (T1–T8) — no cell_state in design")
+    ),
+    p_9_16 = make_panel(
+      filter(plot_tk, other_id %in% 9:16),
+      paste0("T", topic_k, " vs other topics (T9–T16) — no cell_state in design")
+    )
+  )
+}
+
+topic15_plots <- make_tk_plot_nocs(res_directed_nocs, topic_k = 15, alpha = alpha, K = K)
+topic15_plots$p_1_8
+topic15_plots$p_9_16
+
+topic3_plots <- make_tk_plot_nocs(res_directed_nocs, topic_k = 3, alpha = alpha, K = K)
+topic3_plots$p_1_8
+topic3_plots$p_9_16
+```
+
