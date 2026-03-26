@@ -2,7 +2,7 @@
 
 ### LPS
 - `lps4.1`, `lps6.1`: Logit-transformed features
-- `lps3.1`, `lps5.1`: Log pairwise-comparison features
+- `lps3.1`: Log pairwise-comparison features
 - `lps7.1`: Comparison of limma, ASH, and non-EB methods for log pairwise analysis
 - 
 ### Cancer (RNA)
