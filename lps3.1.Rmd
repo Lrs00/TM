@@ -1,0 +1,459 @@
+---
+title: "lps3.1"
+output: pdf_document
+date: "2026-03-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## (pairwise log comparision) for all possble groups (timepoints + tissue)
+
+```{r}
+library(limma)
+library(matrixStats)
+
+# keep all desired timepoints (here: all non-NA)
+samples_sub <- samples
+L_sub <- L
+
+tp <- factor(
+  as.character(samples_sub$timepoint),
+  levels = c("d0","d0.25","d0.5","d1","d2","d3","d5")
+)
+tp <- relevel(tp, ref = "d0")   # <-- set reference
+keep <- !is.na(tp)
+samples_sub <- droplevels(samples_sub[keep, , drop = FALSE])
+L_sub <- L_sub[keep, , drop = FALSE]
+tp <- droplevels(tp[keep])
+
+# ---- topic-specific epsilon eps_k = c0 * median(L_sub[,k]) ----
+c0 <- 1e-4
+med_k <- colMedians(L_sub, na.rm = TRUE)
+eps_k <- c0 * med_k
+
+# guardrails
+eps_min <- 1e-12
+eps_max <- 1e-2
+eps_k <- pmin(pmax(eps_k, eps_min), eps_max)
+
+# optional numerical clamp
+L01 <- pmin(pmax(L_sub, 0), 1)
+
+# ---- build pairwise log-ratios ----
+N <- nrow(L_sub)
+K <- ncol(L_sub)
+
+pair_mat <- t(combn(K, 2))
+n_pairs <- nrow(pair_mat)
+
+log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+
+for (p in seq_len(n_pairs)) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat[, p] <- log(L01[, k1] + eps_k[k1]) -
+                        log(L01[, k2] + eps_k[k2])
+}
+
+colnames(log_ratio_mat) <- apply(
+  pair_mat, 1,
+  function(idx) paste0("T", idx[1], "_vs_T", idx[2])
+)
+
+Y_lr <- t(log_ratio_mat)
+```
+
+```{r}
+library(ggplot2)
+
+# --- 1) Identify the time coefficients (exclude intercept + tissue) ---
+coef_names <- colnames(fit$p.value)
+
+# keep only tp* coefficients (these are vs d0 because you used relevel(tp, "d0"))
+tp_coefs <- grep("^tp", coef_names, value = TRUE)
+
+# --- 2) Parse topic indices from feature names like "T7_vs_T14" ---
+pair_names <- rownames(fit$p.value)  # should match rownames(Y_lr)
+parts <- do.call(rbind, strsplit(pair_names, "_vs_"))
+k1 <- as.integer(sub("^T", "", parts[,1]))
+k2 <- as.integer(sub("^T", "", parts[,2]))
+
+K <- max(c(k1, k2))  # or set explicitly to ncol(L_sub)
+
+# --- 3) Build full grid (topic x topic) once ---
+base_grid <- expand.grid(k1 = 1:K, k2 = 1:K)
+base_grid <- base_grid[base_grid$k1 != base_grid$k2, , drop = FALSE]  # remove diagonal
+
+# helper to build symmetric heatmap grid for one coefficient
+make_grid_for_coef <- function(coef) {
+  pvals <- fit$p.value[, coef]
+  qvals <- p.adjust(pvals, method = "BH")  # BH PER COEFFICIENT
+  sig   <- qvals < 0.05
+
+  df_pairs <- data.frame(k1 = k1, k2 = k2, sig = sig)
+
+  # upper triangle
+  m1 <- merge(base_grid, df_pairs, by = c("k1","k2"), all.x = TRUE)
+
+  # lower triangle (swap)
+  df_swapped <- transform(df_pairs, k1 = k2, k2 = k1)
+  m2 <- merge(base_grid, df_swapped, by = c("k1","k2"), all.x = TRUE)
+
+  base_grid$sig <- ifelse(!is.na(m1$sig), m1$sig, m2$sig)
+  base_grid$coef <- coef
+  base_grid
+}
+
+grid_all <- do.call(rbind, lapply(tp_coefs, make_grid_for_coef))
+
+# --- 4) Plot: one heatmap per coefficient ---
+ggplot(grid_all, aes(x = factor(k1), y = factor(k2), fill = sig)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("TRUE" = "red", "FALSE" = "grey90"),
+                    na.value = "grey95", name = "BH < 0.05") +
+  facet_wrap(~ coef, ncol = 3) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "Significant topic-pair changes vs d0 (per time coefficient)",
+    x = "Topic k1",
+    y = "Topic k2"
+  )
+```
+```{r}
+make_grid_for_coef2 <- function(coef) {
+  pvals <- fit$p.value[, coef]
+  qvals <- p.adjust(pvals, method = "BH")  # BH PER COEFFICIENT
+  neglog10FDR <- -log10(qvals)
+
+  df_pairs <- data.frame(k1 = k1, k2 = k2, neglog10FDR = neglog10FDR)
+
+  m1 <- merge(base_grid, df_pairs, by = c("k1","k2"), all.x = TRUE)
+  df_swapped <- transform(df_pairs, k1 = k2, k2 = k1)
+  m2 <- merge(base_grid, df_swapped, by = c("k1","k2"), all.x = TRUE)
+
+  base_grid$neglog10FDR <- ifelse(!is.na(m1$neglog10FDR), m1$neglog10FDR, m2$neglog10FDR)
+  base_grid$coef <- coef
+  base_grid
+}
+
+grid_all2 <- do.call(rbind, lapply(tp_coefs, make_grid_for_coef2))
+
+ggplot(grid_all2, aes(x = factor(k1), y = factor(k2), fill = neglog10FDR)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(name = "-log10(BH q)") +
+  facet_wrap(~ coef, ncol = 3) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "Pairwise topic comparison vs d0 (per time coefficient)",
+    x = "Topic k1",
+    y = "Topic k2"
+  )
+
+```
+```{r}
+make_grid_for_coef_signedsig <- function(coef) {
+  pvals <- fit$p.value[, coef]
+  qvals <- p.adjust(pvals, method = "BH")
+  lfc   <- fit$coefficients[, coef]
+
+  df_pairs <- data.frame(
+    k1 = k1, k2 = k2,
+    q = qvals,
+    lfc = lfc
+  )
+
+  m1 <- merge(base_grid, df_pairs, by = c("k1","k2"), all.x = TRUE)
+  df_swapped <- transform(df_pairs, k1 = k2, k2 = k1)
+  m2 <- merge(base_grid, df_swapped, by = c("k1","k2"), all.x = TRUE)
+
+  base_grid$q   <- ifelse(!is.na(m1$q),   m1$q,   m2$q)
+  base_grid$lfc <- ifelse(!is.na(m1$lfc), m1$lfc, m2$lfc)
+
+  # signed significance
+  base_grid$signed_sig <- ifelse(base_grid$q < 0.05,
+                                 sign(base_grid$lfc) * (-log10(base_grid$q)),
+                                 0)
+
+  base_grid$coef <- coef
+  base_grid
+}
+
+grid_all <- do.call(rbind, lapply(tp_coefs, make_grid_for_coef_signedsig))
+
+cap <- 5   # cap intensity (adjust)
+grid_all$signed_sig_cap <- pmax(pmin(grid_all$signed_sig, cap), -cap)
+
+ggplot(grid_all, aes(x = factor(k1), y = factor(k2), fill = signed_sig_cap)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "blue", mid = "grey95", high = "red",
+    limits = c(-cap, cap),
+    name = "sign(logFC)\n× -log10(BH)"
+  ) +
+  facet_wrap(~ coef, ncol = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(
+    title = "Signed significance of pairwise changes vs d0 (per time coefficient)",
+    x = "Topic k1",
+    y = "Topic k2"
+  )
+
+```
+```{r}
+make_grid_for_coef_signedsig_all <- function(coef) {
+  pvals <- fit$p.value[, coef]
+  qvals <- p.adjust(pvals, method = "BH")
+  lfc   <- fit$coefficients[, coef]
+
+  df_pairs <- data.frame(k1 = k1, k2 = k2, q = qvals, lfc = lfc)
+
+  m1 <- merge(base_grid, df_pairs, by = c("k1","k2"), all.x = TRUE)
+  df_swapped <- transform(df_pairs, k1 = k2, k2 = k1)
+  m2 <- merge(base_grid, df_swapped, by = c("k1","k2"), all.x = TRUE)
+
+  base_grid$q   <- ifelse(!is.na(m1$q),   m1$q,   m2$q)
+  base_grid$lfc <- ifelse(!is.na(m1$lfc), m1$lfc, m2$lfc)
+  base_grid$sig <- base_grid$q < 0.05
+
+  base_grid$signed_sig <- sign(base_grid$lfc) * (-log10(base_grid$q + 1e-300))
+  base_grid$coef <- coef
+  base_grid
+}
+
+grid_all <- do.call(rbind, lapply(tp_coefs, make_grid_for_coef_signedsig_all))
+
+cap <- 5
+grid_all$signed_sig_cap <- pmax(pmin(grid_all$signed_sig, cap), -cap)
+
+ggplot(grid_all, aes(x = factor(k1), y = factor(k2))) +
+  geom_tile(aes(fill = signed_sig_cap), color = "white") +
+  geom_tile(
+    data = subset(grid_all, sig),
+    fill = NA, color = "black", linewidth = 0.7
+  ) +
+  scale_fill_gradient2(
+    low = "blue", mid = "grey95", high = "red",
+    limits = c(-cap, cap),
+    name = "sign(logFC)\n× -log10(BH)"
+  ) +
+  facet_wrap(~ coef, ncol = 3) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(
+    title = "Pairwise changes vs d0 (fill=signed significance; box=BH<0.05)",
+    x = "Topic k1",
+    y = "Topic k2"
+  )
+```
+
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+cf <- "tpd3"
+
+make_matrices_for_coef <- function(coef) {
+  pvals <- fit$p.value[, coef]
+  qvals <- p.adjust(pvals, method = "BH")
+  lfc   <- fit$coefficients[, coef]
+
+  M_lfc <- matrix(0, nrow = K, ncol = K)
+  M_sig <- matrix(FALSE, nrow = K, ncol = K)
+
+  rownames(M_lfc) <- colnames(M_lfc) <- paste0("T", 1:K)
+  rownames(M_sig) <- colnames(M_sig) <- paste0("T", 1:K)
+
+  for (i in seq_along(lfc)) {
+    a <- k1[i]; b <- k2[i]
+
+    M_lfc[a, b] <-  lfc[i]
+    M_lfc[b, a] <- -lfc[i]
+
+    if (qvals[i] < 0.05) {
+      M_sig[a, b] <- TRUE
+      M_sig[b, a] <- TRUE
+    }
+  }
+
+  diag(M_lfc) <- NA
+  diag(M_sig) <- NA
+
+  list(lfc = M_lfc, sig = M_sig)
+}
+
+M_list <- make_matrices_for_coef(cf)
+M025   <- M_list$lfc
+Sig025 <- M_list$sig
+rng <- quantile(abs(M025), 0.98, na.rm = TRUE)
+
+col_fun <- colorRamp2(
+  c(-rng, 0, rng),
+  c("#2c7bb6", "grey95", "#d7191c")
+)
+ht <- Heatmap(
+  M025,
+  name = "logFC",
+  col = col_fun,
+  na_col = "grey90",
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  column_title = "tpd3 (d3 − d0)",
+  rect_gp = gpar(col = "white", lwd = 0.6),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(Sig025[i, j]) && Sig025[i, j]) {
+      grid.rect(
+        x, y, width, height,
+        gp = gpar(fill = NA, col = "black", lwd = 1.5)
+      )
+    }
+  }
+)
+
+draw(ht, heatmap_legend_side = "right")
+
+```
+## check similarity between topic prorpotions
+```{r}
+
+
+library(ggplot2)
+library(reshape2)
+
+cosine_sim_mat <- function(M) {
+  # M: N x K
+  M <- as.matrix(M)
+  norms <- sqrt(colSums(M^2)) + 1e-12
+  S <- t(M) %*% M
+  S <- S / (norms %o% norms)
+  S
+}
+
+S <- cosine_sim_mat(L)     # K x K
+colnames(S) <- rownames(S) <- paste0("T", 1:ncol(L_sub))
+
+df <- melt(S, varnames = c("Topic1", "Topic2"), value.name = "cos_sim")
+
+ggplot(df, aes(Topic1, Topic2, fill = cos_sim)) +
+  geom_tile(color = "white") +
+  coord_equal() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  labs(title = "Cosine similarity of topic proportions across samples",
+       fill = "cosine")
+
+```
+```{r}
+library(ggplot2)
+library(reshape2)
+
+S <- cosine_sim_mat(L)    # K x K
+colnames(S) <- rownames(S) <- paste0("T", 1:ncol(L))
+diag(S) <- NA             # optional: hide diagonal
+
+df <- melt(S, varnames = c("Topic1", "Topic2"), value.name = "cos_sim")
+df <- df[!is.na(df$cos_sim), ]
+
+df$cos_bin <- cut(
+  df$cos_sim,
+  breaks = c(0, 0.1, 0.2, 0.4, 0.6, 0.8, 1),
+  include.lowest = TRUE,
+  right = FALSE
+)
+ggplot(df, aes(Topic1, Topic2, fill = cos_bin)) +
+  geom_tile(color = "white") +
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  scale_fill_brewer(
+    palette = "YlOrRd",
+    name = "Cosine similarity\n(binned)"
+  ) +
+  labs(
+    title = "Cosine similarity of topic proportions across samples",
+    x = "Topic",
+    y = "Topic"
+  )
+
+```
+```{r}
+library(reshape2)
+
+cosine_sim_mat <- function(M) {
+  M <- as.matrix(M)              # N x K
+  norms <- sqrt(colSums(M^2)) + 1e-12
+  S <- t(M) %*% M                # K x K
+  S <- S / (norms %o% norms)
+  S
+}
+
+# Ensure row alignment between L and samples
+stopifnot(nrow(L) == nrow(samples))
+
+tp <- factor(as.character(samples$timepoint),
+             levels = c("d0","d0.25","d0.5","d1","d2","d3","d5"))
+
+tp_levels <- levels(tp)
+
+df_list <- list()
+
+for (t in tp_levels) {
+  idx <- which(tp == t)
+  if (length(idx) < 2) next   # need >=2 samples to be meaningful
+
+  Lt <- L[idx, , drop = FALSE]
+  S_t <- cosine_sim_mat(Lt)
+
+  colnames(S_t) <- rownames(S_t) <- paste0("T", 1:ncol(L))
+  diag(S_t) <- NA
+
+  df_t <- melt(S_t, varnames = c("Topic1","Topic2"), value.name = "cos_sim")
+  df_t$timepoint <- t
+  df_list[[t]] <- df_t
+}
+
+df_all <- do.call(rbind, df_list)
+
+```
+
+
+```{r}
+df_all$cos_bin <- cut(
+  df_all$cos_sim,
+  breaks = c(0, 0.1, 0.2, 0.4, 0.6, 0.8, 1),
+  include.lowest = TRUE,
+  right = FALSE
+)
+
+ggplot(df_all, aes(Topic1, Topic2, fill = cos_bin)) +
+  geom_tile(color = "white") +
+  coord_equal() +
+  facet_wrap(~ timepoint) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  scale_fill_brewer(palette = "YlOrRd", name = "Cosine\n(binned)") +
+  labs(title = "Binned cosine similarity within each timepoint",
+       x = "Topic", y = "Topic")
+
+```
