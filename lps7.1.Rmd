@@ -1,0 +1,418 @@
+---
+title: "lps7.1"
+output: html_document
+date: "2026-03-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(Matrix)
+library(readr)
+library(data.table)
+library(fastTopics)
+library(ebnm)
+library(flashier)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+library(rsvd)
+library(uwot)
+
+library(limma)
+library(matrixStats)
+library(ashr)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+```
+
+## 1. Read and preprocess LPS data
+```{r}
+read_lps_data <- function (file) {
+  counts <- fread(file)
+  class(counts) <- "data.frame"
+  genes <- counts[,1]
+  counts <- t(as.matrix(counts[,-1]))
+  colnames(counts) <- genes
+  samples <- rownames(counts)
+  samples <- strsplit(samples,"_")
+  samples <- data.frame(tissue    = sapply(samples,"[[",1),
+                        timepoint = sapply(samples,"[[",2),
+                        mouse     = sapply(samples,"[[",3))
+  samples <- transform(samples,
+                       tissue    = factor(tissue),
+					   timepoint = factor(timepoint),
+					   mouse     = factor(mouse))
+  return(list(samples = samples,counts = counts))
+}
+out <- read_lps_data("../data/lps.csv.gz")
+samples <- out$samples
+counts  <- out$counts
+rm(out)
+
+dim(samples)
+dim(counts)
+#column = one gene,
+counts
+samples
+```
+
+Remove a sample that appears to be an outlier based on the NMF analyses:
+
+```{r filter-outliers}
+i       <- which(rownames(counts) != "iLN_d2_20")
+samples <- samples[i,]
+counts  <- counts[i,]
+```
+
+Remove genes that are expressed in fewer than 5 samples:
+
+```{r filter-genes}
+j <- which(colSums(counts > 0) > 4)
+counts <- counts[,j]
+```
+
+
+## 2. Fit topic model and structure plot
+
+
+```{r fit-topic-model, cache=TRUE}
+set.seed(1)
+tm <- fit_poisson_nmf(counts,k = 14,init.method = "random",method = "em",
+                      numiter = 20,verbose = "none",
+					  control = list(numiter = 4,nc = 8,extrapolate = FALSE))
+tm <- fit_poisson_nmf(counts,fit0 = tm,method = "scd",numiter = 40,
+                      control = list(numiter = 4,nc = 8,extrapolate = TRUE),
+					  verbose = "none")
+tm_mn <- poisson2multinom(tm)
+L <- tm_mn$L 
+```
+
+
+## 3. Build pairwise log-ratios and fit limma
+
+```{r}
+tp <- factor(
+  as.character(samples$timepoint),
+  levels = c("d0","d0.25","d0.5","d1","d2","d3","d5")
+)
+tp <- relevel(tp, ref = "d0")
+
+keep <- !is.na(tp)
+samples_sub <- droplevels(samples[keep, , drop = FALSE])
+L_sub <- L[keep, , drop = FALSE]
+tp <- droplevels(tp[keep])
+
+N <- nrow(L_sub)
+K <- ncol(L_sub)
+
+# topic-specific epsilon
+c0 <- 1e-4
+med_k <- colMedians(L_sub, na.rm = TRUE)
+eps_k <- c0 * med_k
+eps_k <- pmin(pmax(eps_k, 1e-12), 1e-2)
+
+# clamp to [0,1]
+L01 <- pmin(pmax(L_sub, 0), 1)
+
+pair_mat <- t(combn(K, 2))
+n_pairs <- nrow(pair_mat)
+
+log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+for (p in seq_len(n_pairs)) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat[, p] <- log(L01[, k1] + eps_k[k1]) -
+                        log(L01[, k2] + eps_k[k2])
+}
+
+colnames(log_ratio_mat) <- apply(pair_mat, 1, function(idx) {
+  paste0("T", idx[1], "_vs_T", idx[2])
+})
+
+Y_lr <- t(log_ratio_mat)
+
+design <- model.matrix(~ tp + tissue, data = samples_sub)
+colnames(design) <- make.names(colnames(design))
+
+fit <- lmFit(Y_lr, design)
+fit <- eBayes(fit)
+```
+
+
+## 4. Pairwise significance heatmap input
+
+```{r}
+coef_names <- colnames(fit$p.value)
+tp_coefs <- grep("^tp", coef_names, value = TRUE)
+
+pair_names <- rownames(fit$p.value)
+parts <- do.call(rbind, strsplit(pair_names, "_vs_"))
+k1 <- as.integer(sub("^T", "", parts[, 1]))
+k2 <- as.integer(sub("^T", "", parts[, 2]))
+
+K <- max(c(k1, k2))
+
+base_grid <- expand.grid(k1 = 1:K, k2 = 1:K)
+base_grid <- base_grid[base_grid$k1 != base_grid$k2, , drop = FALSE]
+
+make_grid_for_coef <- function(coef_name) {
+  pvals <- fit$p.value[, coef_name]
+  qvals <- p.adjust(pvals, method = "BH")
+  sig <- qvals < 0.05
+
+  df_pairs <- data.frame(k1 = k1, k2 = k2, sig = sig)
+
+  m1 <- merge(base_grid, df_pairs, by = c("k1", "k2"), all.x = TRUE)
+  df_swapped <- transform(df_pairs, k1 = k2, k2 = k1)
+  m2 <- merge(base_grid, df_swapped, by = c("k1", "k2"), all.x = TRUE)
+
+  out <- base_grid
+  out$sig <- ifelse(!is.na(m1$sig), m1$sig, m2$sig)
+  out$coef <- coef_name
+  out
+}
+
+grid_all <- do.call(rbind, lapply(tp_coefs, make_grid_for_coef))
+```
+
+
+
+## 5. Compare ordinary, limma, and ASH
+
+```{r}
+fit0 <- lmFit(Y_lr, design)
+
+coef_hat <- fit0$coefficients
+se_hat <- sweep(fit0$stdev.unscaled, 1, fit0$sigma, "*")
+
+t_ord <- coef_hat / se_hat
+p_ord <- 2 * pt(-abs(t_ord), df = fit0$df.residual)
+
+fit_eb <- eBayes(fit0)
+
+df_resid <- unique(fit0$df.residual)
+
+ash_list <- lapply(tp_coefs, function(coef_name) {
+  j <- match(coef_name, colnames(coef_hat))
+  ash(coef_hat[, j], se_hat[, j], df = df_resid)
+})
+names(ash_list) <- tp_coefs
+```
+
+
+```{r}
+q_ord <- apply(p_ord[, tp_coefs, drop = FALSE], 2, p.adjust, method = "BH")
+q_limma <- apply(fit_eb$p.value[, tp_coefs, drop = FALSE], 2, p.adjust, method = "BH")
+
+q_ash_mat <- sapply(ash_list, function(a) get_qvalue(a))
+sig_ash <- q_ash_mat < 0.05
+colnames(sig_ash) <- tp_coefs
+rownames(sig_ash) <- rownames(Y_lr)
+```
+
+
+```{r}
+state_mat <- sapply(tp_coefs, function(coef_name) {
+  paste0(
+    ifelse(q_ord[, coef_name]   < 0.05, "N", "-"),
+    ifelse(q_limma[, coef_name] < 0.05, "L", "-"),
+    ifelse(sig_ash[, coef_name],        "A", "-")
+  )
+})
+
+colnames(state_mat) <- tp_coefs
+rownames(state_mat) <- rownames(Y_lr)
+
+state_levels <- c("---", "N--", "-L-", "--A", "NL-", "N-A", "-LA", "NLA")
+
+state_frac <- sapply(tp_coefs, function(coef_name) {
+  tab <- table(factor(state_mat[, coef_name], levels = state_levels))
+  as.numeric(tab) / nrow(state_mat)
+})
+
+colnames(state_frac) <- tp_coefs
+rownames(state_frac) <- state_levels
+```
+
+
+```{r}
+df_plot <- reshape2::melt(state_frac)
+colnames(df_plot) <- c("state", "coefficient", "fraction")
+
+ggplot(df_plot, aes(x = state, y = coefficient, fill = fraction)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Agreement of pairwise significance calls across three methods",
+    x = "Significance state (N=ordinary, L=limma, A=ASH)",
+    y = "Coefficient",
+    fill = "Fraction of pairs"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+## 6. Reusable anchor-topic trajectory helpers
+
+```{r}
+time_map <- c(
+  "tpd0.25" = 0.25,
+  "tpd0.5"  = 0.5,
+  "tpd1"    = 1,
+  "tpd2"    = 2,
+  "tpd3"    = 3,
+  "tpd5"    = 5
+)
+
+make_anchor_pair_info <- function(anchor_topic, Y_lr) {
+  pair_keep <- grepl(
+    paste0("^T", anchor_topic, "_vs_T|_vs_T", anchor_topic, "$"),
+    rownames(Y_lr)
+  )
+  pair_names_anchor <- rownames(Y_lr)[pair_keep]
+
+  parts_anchor <- do.call(rbind, strsplit(pair_names_anchor, "_vs_"))
+  left_topic  <- as.integer(sub("^T", "", parts_anchor[, 1]))
+  right_topic <- as.integer(sub("^T", "", parts_anchor[, 2]))
+
+  flip_sign <- (right_topic == anchor_topic)
+  other_topic <- ifelse(left_topic == anchor_topic, right_topic, left_topic)
+
+  pair_info <- data.frame(
+    pair = pair_names_anchor,
+    left_topic = left_topic,
+    right_topic = right_topic,
+    other_topic = other_topic,
+    flip_sign = flip_sign,
+    pair_label = paste0("T", anchor_topic, "_vs_T", other_topic),
+    stringsAsFactors = FALSE
+  )
+
+  list(pair_keep = pair_keep, pair_names_anchor = pair_names_anchor, pair_info = pair_info)
+}
+
+make_limma_anchor_df <- function(anchor_topic, Y_lr, fit_eb, tp_coefs, time_map) {
+  anchor_obj <- make_anchor_pair_info(anchor_topic, Y_lr)
+  pair_keep <- anchor_obj$pair_keep
+  pair_names_anchor <- anchor_obj$pair_names_anchor
+  pair_info <- anchor_obj$pair_info
+
+  coef_limma_mat <- fit_eb$coefficients[pair_keep, tp_coefs, drop = FALSE]
+
+  q_limma2 <- sapply(tp_coefs, function(coef_name) {
+    p.adjust(fit_eb$p.value[pair_keep, coef_name], method = "BH")
+  })
+  colnames(q_limma2) <- tp_coefs
+  rownames(q_limma2) <- pair_names_anchor
+
+  df_limma <- expand.grid(
+    pair = pair_names_anchor,
+    coef_name = tp_coefs,
+    stringsAsFactors = FALSE
+  )
+
+  df_limma <- merge(df_limma, pair_info, by = "pair", all.x = TRUE)
+
+  df_limma$estimate_raw <- mapply(function(p, c) coef_limma_mat[p, c],
+                                  df_limma$pair, df_limma$coef_name)
+
+  df_limma$estimate <- ifelse(df_limma$flip_sign,
+                              -df_limma$estimate_raw,
+                              df_limma$estimate_raw)
+
+  df_limma$signif <- mapply(function(p, c) q_limma2[p, c] < 0.05,
+                            df_limma$pair, df_limma$coef_name)
+
+  df_limma$time <- unname(time_map[df_limma$coef_name])
+  df_limma$method <- "limma"
+  df_limma
+}
+
+make_ash_anchor_df <- function(anchor_topic, Y_lr, coef_hat, ash_list, tp_coefs, time_map, use_pm = FALSE) {
+  anchor_obj <- make_anchor_pair_info(anchor_topic, Y_lr)
+  pair_keep <- anchor_obj$pair_keep
+  pair_names_anchor <- anchor_obj$pair_names_anchor
+  pair_info <- anchor_obj$pair_info
+
+  names(ash_list) <- tp_coefs
+
+  q_ash_mat <- do.call(cbind, lapply(tp_coefs, function(coef_name) {
+    get_qvalue(ash_list[[coef_name]])[pair_keep]
+  }))
+  colnames(q_ash_mat) <- tp_coefs
+  rownames(q_ash_mat) <- pair_names_anchor
+
+  if (use_pm) {
+    coef_ash_mat <- do.call(cbind, lapply(tp_coefs, function(coef_name) {
+      get_pm(ash_list[[coef_name]])[pair_keep]
+    }))
+    colnames(coef_ash_mat) <- tp_coefs
+    rownames(coef_ash_mat) <- pair_names_anchor
+  } else {
+    coef_ash_mat <- coef_hat[pair_keep, tp_coefs, drop = FALSE]
+  }
+
+  df_ash <- expand.grid(
+    pair = pair_names_anchor,
+    coef_name = tp_coefs,
+    stringsAsFactors = FALSE
+  )
+
+  df_ash <- merge(df_ash, pair_info, by = "pair", all.x = TRUE)
+
+  df_ash$estimate_raw <- mapply(function(p, c) coef_ash_mat[p, c],
+                                df_ash$pair, df_ash$coef_name)
+
+  df_ash$estimate <- ifelse(df_ash$flip_sign,
+                            -df_ash$estimate_raw,
+                            df_ash$estimate_raw)
+
+  df_ash$signif <- mapply(function(p, c) q_ash_mat[p, c] < 0.05,
+                          df_ash$pair, df_ash$coef_name)
+
+  df_ash$time <- unname(time_map[df_ash$coef_name])
+  df_ash$method <- "ASH"
+  df_ash
+}
+
+plot_anchor_df <- function(df_in, anchor_topic, method_label) {
+  ggplot(df_in, aes(x = time, y = estimate, group = pair_label)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    geom_line(color = "black") +
+    geom_point(aes(fill = signif), shape = 21, color = "black", size = 1.5) +
+    facet_wrap(~ pair_label, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values = c("TRUE" = "black", "FALSE" = "white"),
+                      name = ifelse(method_label == "limma", "BH < 0.05", "ASH q < 0.05")) +
+    labs(
+      title = paste0("Anchor topic T", anchor_topic, " vs all others (", method_label, ")"),
+      x = "Time",
+      y = paste0("Estimated effect on log(T", anchor_topic, "/other) vs d0")
+    ) +
+    theme_bw(base_size = 13)
+}
+```
+
+
+## 7. Anchor topic plots for T1 and T7
+
+```{r}
+anchor_topic <- 1
+df_limma_T1 <- make_limma_anchor_df(anchor_topic, Y_lr, fit_eb, tp_coefs, time_map)
+df_ash_T1   <- make_ash_anchor_df(anchor_topic, Y_lr, coef_hat, ash_list, tp_coefs, time_map, use_pm = FALSE)
+
+plot_anchor_df(df_limma_T1, anchor_topic, "limma")
+plot_anchor_df(df_ash_T1, anchor_topic, "ASH")
+```
+
+
+```{r}
+anchor_topic <- 7
+df_limma_T7 <- make_limma_anchor_df(anchor_topic, Y_lr, fit_eb, tp_coefs, time_map)
+df_ash_T7   <- make_ash_anchor_df(anchor_topic, Y_lr, coef_hat, ash_list, tp_coefs, time_map, use_pm = FALSE)
+
+plot_anchor_df(df_limma_T7, anchor_topic, "limma")
+plot_anchor_df(df_ash_T7, anchor_topic, "ASH")
+```
