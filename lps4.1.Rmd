@@ -88,13 +88,16 @@ L     <- tm_mn$L               # samples × topics matrix
 
 ```{r}
 library(limma)
+library(matrixStats)
 
 # L: N x K  (samples x topics)
 stopifnot(nrow(L) == nrow(samples))
 
 # timepoint factor with d0 as reference
-tp <- factor(as.character(samples$timepoint),
-             levels = c("d0","d0.25","d0.5","d1","d2","d3","d5"))
+tp <- factor(
+  as.character(samples$timepoint),
+  levels = c("d0","d0.25","d0.5","d1","d2","d3","d5")
+)
 tp <- relevel(tp, ref = "d0")
 
 keep <- !is.na(tp)
@@ -102,16 +105,28 @@ samples_sub <- droplevels(samples[keep, , drop = FALSE])
 L_sub <- L[keep, , drop = FALSE]
 tp <- droplevels(tp[keep])
 
-# log-odds transform: Z_{ik} = log((theta+eps)/(1-theta+eps))
-eps <- 1e-8
-Z <- log((L_sub + eps) / (1 - L_sub + eps))   # N x K
+# ---- topic-specific epsilon eps_k = c0 * median(L_sub[,k]) ----
+c0 <- 1e-4
+med_k <- colMedians(L_sub, na.rm = TRUE)
+eps_k <- c0 * med_k
+
+# guardrails
+eps_min <- 1e-12
+eps_max <- 1e-2
+eps_k <- pmin(pmax(eps_k, eps_min), eps_max)
+
+# optional numerical clamp
+L01 <- pmin(pmax(L_sub, 0), 1)
+
+# log-odds transform: Z_{ik} = log((theta+eps_k)/(1-theta+eps_k))
+num <- sweep(L01, 2, eps_k, FUN = "+")
+den <- sweep(1 - L01, 2, eps_k, FUN = "+")
+Z <- log(num / den)   # N x K
 
 # limma expects features x samples => K x N
 Y <- t(Z)
-rownames(Y) <- paste0("T", seq_len(ncol(L_sub)))  # topic names
-
+rownames(Y) <- paste0("T", seq_len(ncol(L_sub)))
 ```
-
 
 
 ## Model: (logit) compare all timepoints (tp + tissue)
