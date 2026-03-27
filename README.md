@@ -1,6 +1,7 @@
 ## File guide
 
 ### LPS
+- `lps1.1`: LPS dataset loading and overview
 - `lps4.1`: Logit-transformed features
 - `lps3.1`: Log pairwise-comparison features
 - `lps7.1`: Comparison of limma, ASH, and non-EB methods for log pairwise analysis
