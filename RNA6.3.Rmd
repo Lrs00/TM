@@ -15,6 +15,14 @@ library(limma)
 library(ashr)
 ```
 
+```{r}
+library(JuliaCall)
+
+julia_setup(JULIA_HOME = "/opt/anaconda3/julia_env/pyjuliapkg/install/bin")
+julia_command('import Pkg')
+julia_command('Pkg.activate("/opt/anaconda3/julia_env")')
+julia_command("using Empirikos, Hypatia, MultipleTesting")
+```
 
 ## 1. Build pairwise feature matrix once
 
