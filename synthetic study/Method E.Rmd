@@ -1,0 +1,500 @@
+---
+title: "Method E logit"
+output: pdf_document
+date: "2025-10-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(MCMCpack)   # for Dirichlet()
+library(MASS)       # for mvrnorm if needed
+
+simulate_topics_dirichlet <- function(
+  N = 1000,         # number of cells
+  G = 500,          # number of genes
+  K = 5,            # number of topics
+  frac_diff = 0.4,  # fraction of topics with nonzero beta
+  beta_strength = 2,
+  seed = 123
+) {
+  set.seed(seed)
+  
+  # -------------------------
+  # 1️⃣ Condition assignment
+  # -------------------------
+  X <- rbinom(N, 1, 0.5)   # 0 = control, 1 = treatment
+  
+  # -------------------------
+  # 2️⃣ Topic-level effects
+  # -------------------------
+  mu_k   <- rnorm(K, 0, 1)
+  diff_k <- sample(c(TRUE, FALSE), K, replace = TRUE,
+                   prob = c(frac_diff, 1 - frac_diff))
+  beta_k <- ifelse(diff_k, rnorm(K, mean = beta_strength, sd = 0.5), 0)
+  
+  # -------------------------
+  # 3️⃣ Latent logits η_{nk}
+  # -------------------------
+  eta <- matrix(NA, nrow = N, ncol = K)
+  for (k in seq_len(K)) {
+    eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  }
+  
+  # -------------------------
+  # 4️⃣ Topic proportions (softmax)
+  # -------------------------
+  softmax <- function(v) exp(v) / sum(exp(v))
+  ## Topic proportions per sample (cells × topics)
+  Z <- t(apply(eta, 1, softmax))
+  stopifnot(all(abs(rowSums(Z) - 1) < 1e-8))
+  
+  # -------------------------
+  # 5️⃣ Topic–gene weights with Dirichlet normalization
+  # -------------------------
+  T_mat <- matrix(rlnorm(K * G, meanlog = 0, sdlog = 1), K, G)
+  ## Topic–gene weights (topics × genes)
+  W <- matrix(NA, nrow = K, ncol = G)
+  for (k in seq_len(K)) {
+    W[k, ] <- rdirichlet(1, alpha = T_mat[k, ])
+  }
+  rownames(W) <- paste0("Topic", seq_len(K))
+  
+  # -------------------------
+  # 6️⃣ Library size per cell
+  # -------------------------
+  l_n <- runif(N, 1000, 10000)
+  
+  # -------------------------
+  # 7️⃣ Gene-specific dispersion
+  # -------------------------
+  alpha_g <- rexp(G, rate = 0.2)   # mean = 5
+  
+  # -------------------------
+  # 8️⃣ Latent mean expression
+  # -------------------------
+  mean_ng <- Z %*% W   # expected proportion per gene
+  mean_ng <- mean_ng * l_n  # scale by library size
+  
+  # -------------------------
+  # 9️⃣ Gamma–Poisson hierarchy
+  # -------------------------
+  X_ng <- matrix(NA, nrow = N, ncol = G)
+  for (g in seq_len(G)) {
+    shape <- alpha_g[g]
+    rate  <- alpha_g[g] / mean_ng[, g]
+    X_ng[, g] <- rgamma(N, shape = shape, rate = rate)
+  }
+  Y_ng <- matrix(rpois(N * G, lambda = as.vector(X_ng)), N, G)
+  
+  # -------------------------
+  # 🔟 Return simulation outputs
+  # -------------------------
+  list(
+    Y = Y_ng,                  # observed counts
+    Z = Z,                     # topic proportions
+    W = W,                     # topic–gene weights
+    beta_true = beta_k,        # true condition effects
+    diff_topics = diff_k,      # logical vector
+    diff_topic_ids = which(diff_k),
+    X = X,                     # condition
+    mu = mu_k,
+    alpha_g = alpha_g,
+    library_size = l_n
+  )
+}
+```
+
+## RUN Log+limma
+```{r}
+run_one_sim_logit <- function(
+  N = 1000, G = 300, K = 6,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 1
+) {
+  # ---- 1️⃣ Simulate data ----
+  sim <- simulate_topics_dirichlet(
+    N = N,
+    G = G,
+    K = K,
+    frac_diff = frac_diff,
+    beta_strength = beta_strength,
+    seed = seed
+  )
+  
+  Z <- sim$Z
+  X_cond <- sim$X
+  true_topics <- sim$diff_topics  # logical: which topics truly differ
+  
+  # ---- 2️⃣ Logit ("topic vs rest") transform ----
+  eps <- 1e-8  # avoid log(0)
+  Z_logit <- log( (Z + eps) / (1 - Z + eps) )
+  colnames(Z_logit) <- paste0("Topic", seq_len(ncol(Z_logit)))
+  
+  # ---- 3️⃣ Design matrix ----
+  design <- model.matrix(~ X_cond)
+  
+  # ---- 4️⃣ Fit limma model ----
+  fit <- lmFit(t(Z_logit), design)
+  fit <- eBayes(fit)
+  
+  # ---- 5️⃣ Extract results ----
+  res <- topTable(fit, coef = 2, number = Inf)
+  
+  # ---- 6️⃣ Discoveries ----
+  disc <- res$adj.P.Val < 0.05
+  
+  # ---- 7️⃣ Return all key outputs ----
+  list(
+    disc = disc,                       # which topics significant
+    true_topics = true_topics,         # true differential topics
+    pvals = res$P.Value,               # raw p-values
+    adj_pvals = res$adj.P.Val,         # FDR-adjusted p-values
+    res = res                          # full limma table
+  )
+}
+
+
+```
+
+```{r}
+out <- run_one_sim_logit(seed = 11)
+out$res         # limma results table
+out$disc        # which topics we called
+out$true_topics # which ones truly changed in the generative model
+
+```
+```{r}
+compute_metrics <- function(disc, true_topics) {
+  # Power
+  if (any(true_topics)) {
+    power <- mean(disc[true_topics])
+  } else {
+    power <- NA  # shouldn't happen unless frac_diff=0
+  }
+
+  # Empirical FDR
+  n_disc <- sum(disc)
+  if (n_disc == 0) {
+    emp_fdr <- 0
+  } else {
+    false_pos <- disc & !true_topics
+    emp_fdr <- sum(false_pos) / n_disc
+  }
+
+  list(power = power, emp_fdr = emp_fdr)
+}
+
+m <- compute_metrics(out$disc, out$true_topics)
+m$power
+m$emp_fdr
+
+```
+
+```{r}
+set.seed(999)
+
+R <- 100
+power_vec <- numeric(R)
+fdr_vec   <- numeric(R)
+
+for (r in 1:R) {
+  out <- run_one_sim_logit(
+    N = 2000,
+    G = 300,
+    K = 6,
+    frac_diff = 0.4,
+    beta_strength = 2,
+    seed = r
+  )
+
+  m <- compute_metrics(out$disc, out$true_topics)
+  power_vec[r] <- m$power
+  fdr_vec[r]   <- m$emp_fdr
+}
+
+cat("=== Logit + limma : SIGNAL scenario ===\n")
+cat("Mean power across 100 sims     =", round(mean(power_vec, na.rm = TRUE), 3), "\n")
+cat("Mean empirical FDR across sims =", round(mean(fdr_vec), 3), "\n")
+cat("Prop runs with ANY detection   =", round(mean(power_vec > 0, na.rm = TRUE), 3), "\n")
+```
+## signal Stability + FDR / POWER
+
+```{r}
+stability_for_dataset_logit <- function(sim, B = 50, fdr_thresh = 0.05) {
+  # sim = output of simulate_topics_dirichlet()
+  # B   = number of bootstrap resamples
+  
+  Z <- sim$Z          # N x K topic proportions
+  X <- sim$X          # length N condition labels
+  K <- ncol(Z)
+  
+  # store discoveries for each bootstrap
+  disc_mat <- matrix(FALSE, nrow = B, ncol = K)
+  
+  for (b in 1:B) {
+    # 1️⃣ bootstrap resample cells with replacement
+    idx <- sample(seq_len(nrow(Z)), replace = TRUE)
+    Z_b <- Z[idx, , drop = FALSE]
+    X_b <- X[idx]
+    
+    # 2️⃣ logit transform: topic vs. rest
+    eps <- 1e-8
+    Z_logit_b <- log((Z_b + eps) / (1 - Z_b + eps))
+    colnames(Z_logit_b) <- paste0("Topic", seq_len(ncol(Z_logit_b)))
+    
+    # 3️⃣ design matrix
+    design_b <- model.matrix(~ X_b)
+    
+    # 4️⃣ fit limma model
+    fit_b <- lmFit(t(Z_logit_b), design_b)
+    fit_b <- eBayes(fit_b)
+    res_b <- topTable(fit_b, coef = 2, number = Inf)
+    
+    # 5️⃣ call discoveries at FDR threshold
+    disc_mat[b, ] <- (res_b$adj.P.Val < fdr_thresh)
+  }
+  
+  # ---- stability metrics ----
+  
+  # 1️⃣ topic-level stability
+  topic_freq <- colMeans(disc_mat)  # how often each topic was significant
+  
+  # 2️⃣ set-level stability (Jaccard overlap)
+  jaccard <- function(a, b) {
+    inter <- sum(a & b)
+    union <- sum(a | b)
+    if (union == 0) return(NA_real_)
+    inter / union
+  }
+  
+  pair_ids <- combn(B, 2)
+  jacc_vals <- apply(pair_ids, 2, function(ix) {
+    jaccard(disc_mat[ix[1], ], disc_mat[ix[2], ])
+  })
+  
+  mean_jacc <- mean(jacc_vals, na.rm = TRUE)
+  
+  # ---- return
+  list(
+    topic_freq = topic_freq,   # per-topic stability [0–1]
+    mean_jacc = mean_jacc,     # overall discovery set stability
+    disc_mat = disc_mat        # raw TRUE/FALSE discovery calls
+  )
+}
+
+```
+
+
+```{r}
+compute_metrics <- function(disc, true_topics) {
+  # Power
+  if (any(true_topics)) {
+    power <- mean(disc[true_topics])
+  } else {
+    power <- NA  # shouldn't happen unless frac_diff=0
+  }
+
+  # Empirical FDR
+  n_disc <- sum(disc)
+  if (n_disc == 0) {
+    emp_fdr <- 0
+  } else {
+    false_pos <- disc & !true_topics
+    emp_fdr <- sum(false_pos) / n_disc
+  }
+
+  list(power = power, emp_fdr = emp_fdr)
+}
+```
+
+```{r}
+set.seed(999)
+
+R <- 100
+power_vec    <- numeric(R)
+fdr_vec      <- numeric(R)
+stab_jaccvec <- numeric(R)    # one stability score per simulation
+stab_avgfreq <- numeric(R)    # avg per-topic freq of discoveries
+
+for (r in 1:R) {
+  # ---- simulate ONE dataset with signal
+  sim <- simulate_topics_dirichlet(
+    N = 2000,
+    G = 300,
+    K = 6,
+    frac_diff = 0.4,      # some topics truly change with condition
+    beta_strength = 2,
+    seed = r
+  )
+  
+  # ---- run the method once on the full dataset
+  out <- run_one_sim_logit(
+    N = 2000,
+    G = 300,
+    K = 6,
+    frac_diff = 0.4,
+    beta_strength = 2,
+    seed = r
+  )
+  
+  # compute power / FDR from that run
+  m <- compute_metrics(out$disc, out$true_topics)
+  power_vec[r] <- m$power
+  fdr_vec[r]   <- m$emp_fdr
+  
+  # ---- now: stability via bootstrap resampling of THIS dataset
+  stab <- stability_for_dataset_logit(sim, B = 50, fdr_thresh = 0.05)
+  
+  # store:
+  stab_jaccvec[r] <- stab$mean_jacc
+  # stab$topic_freq is per-topic; you can average it or keep all of it
+  stab_avgfreq[r] <- mean(stab$topic_freq)
+}
+
+cat("=== Logit + limma : SIGNAL scenario ===\n")
+cat("Mean power across sims          =", round(mean(power_vec, na.rm=TRUE), 3), "\n")
+cat("Mean empirical FDR across sims  =", round(mean(fdr_vec), 3), "\n")
+cat("Mean Jaccard stability          =", round(mean(stab_jaccvec, na.rm=TRUE), 3), "\n")
+cat("Mean topic discovery frequency  =", round(mean(stab_avgfreq, na.rm=TRUE), 3), "\n")
+
+```
+```{r}
+# --- Single simulation + bootstrap stability analysis ---
+
+set.seed(123)
+
+# 1️⃣ Simulate ONE dataset
+sim <- simulate_topics_dirichlet(
+  N = 2000,
+  G = 300,
+  K = 6,
+  frac_diff = 0.4,      # fraction of truly different topics
+  beta_strength = 2,
+  seed = 123
+)
+
+cat("True differential topics (1 = true effect):\n")
+print(sim$diff_topics)
+
+# 2️⃣ Run method once on full dataset
+out <- run_one_sim_logit(
+  N = 2000,
+  G = 300,
+  K = 6,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 123
+)
+
+# Compute power/FDR for this single run
+m <- compute_metrics(out$disc, out$true_topics)
+cat("\n=== Logit+ limma : single run ===\n")
+cat("Power =", round(m$power, 3), "\n")
+cat("Empirical FDR =", round(m$emp_fdr, 3), "\n")
+
+# 3️⃣ Bootstrap stability (B = 50)
+stab <- stability_for_dataset_logit(sim, B = 50, fdr_thresh = 0.05)
+
+# 4️⃣ Summaries
+cat("\n=== Bootstrap stability results (B = 50) ===\n")
+cat("Mean Jaccard stability =", round(stab$mean_jacc, 3), "\n\n")
+
+# topic_freq: how often each topic was discovered (0–1)
+cat("Topic-level discovery frequencies:\n")
+topic_summary <- data.frame(
+  Topic = paste0("Topic", seq_along(stab$topic_freq)),
+  TrueDiff = sim$diff_topics,
+  DiscoveryFreq = round(stab$topic_freq, 3)
+)
+print(topic_summary, row.names = FALSE)
+```
+
+
+
+
+
+## NULL
+```{r}
+set.seed(999)
+
+R <- 100
+power_vec <- numeric(R)
+fdr_vec   <- numeric(R)
+
+for (r in 1:R) {
+  out <- run_one_sim_logit(
+    N = 2000,
+    G = 300,
+    K = 6,
+    frac_diff = 0.0,
+    beta_strength = 2,
+    seed = r
+  )
+
+  m <- compute_metrics(out$disc, out$true_topics)
+  power_vec[r] <- m$power
+  fdr_vec[r]   <- m$emp_fdr
+}
+
+cat("=== Logit + limma : NULL scenario ===\n")
+cat("Mean empirical FDR across sims =", round(mean(fdr_vec), 3), "\n")
+```
+
+```{r}
+K <- 6
+R <- 100
+pvals_by_topic <- matrix(NA, nrow = R, ncol = K)
+
+for (r in 1:R) {
+  out <- run_one_sim_clr(
+    N = 2000,
+    G = 300,
+    K = K,
+    frac_diff = 0.0,
+    beta_strength = 2,
+    seed = r
+  )
+  pvals_by_topic[r, ] <- out$pvals
+}
+par(mfrow = c(2, 3))  # for K = 6
+for (k in 1:K) {
+  hist(pvals_by_topic[, k],
+       breaks = 20, col = "skyblue", border = "white",
+       main = paste("Topic", k), xlab = "P-value", ylab = "Frequency")
+  abline(h = R / 20, col = "red", lty = 2)
+}
+par(mfrow = c(1, 1))
+```
+
+
+```{r}
+K <- 6
+R <- 100
+pvals_by_topic <- matrix(NA, nrow = R, ncol = K)
+
+for (r in 1:R) {
+  out <- run_one_sim_logit(
+    N = 2000,
+    G = 300,
+    K = K,
+    frac_diff = 0.0,
+    beta_strength = 2,
+    seed = r
+  )
+  pvals_by_topic[r, ] <- out$adj_pvals
+}
+par(mfrow = c(2, 3))  # for K = 6
+for (k in 1:K) {
+  hist(pvals_by_topic[, k],
+       breaks = 20, col = "skyblue", border = "white",
+       main = paste("Topic", k), xlab = "P-value", ylab = "Frequency")
+  abline(h = R / 20, col = "red", lty = 2)
+}
+par(mfrow = c(1, 1))
+
+```
+
