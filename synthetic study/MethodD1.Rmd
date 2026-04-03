@@ -1,0 +1,299 @@
+---
+title: "Method D CLR+Limma"
+output: pdf_document
+date: "2025-10-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+## --- Packages ---
+library(MCMCpack)     # rdirichlet
+library(compositions) # acomp, clr
+library(limma)
+
+## --- 1. Simulator ---
+simulate_topics_dirichlet <- function(
+  N = 1000,
+  G = 500,
+  K = 5,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 123
+) {
+  set.seed(seed)
+
+  # condition
+  X <- rbinom(N, 1, 0.5)
+
+  # topic-level effects
+  mu_k   <- rnorm(K, 0, 1)
+  diff_k <- sample(c(TRUE, FALSE), K, replace = TRUE,
+                   prob = c(frac_diff, 1 - frac_diff))
+  beta_k <- ifelse(diff_k, rnorm(K, mean = beta_strength, sd = 0.5), 0)
+
+  # latent logits
+  eta <- sapply(seq_len(K), function(k) {
+    rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  })
+
+  # softmax topic proportions
+  softmax <- function(v) exp(v) / sum(exp(v))
+  Z <- t(apply(eta, 1, softmax))
+  stopifnot(all(abs(rowSums(Z) - 1) < 1e-8))
+
+  # topic-gene weights
+  T_mat <- matrix(rlnorm(K * G, meanlog = 0, sdlog = 1), K, G)
+  W <- t(apply(T_mat, 1, function(a) MCMCpack::rdirichlet(1, a)))
+  rownames(W) <- paste0("Topic", seq_len(K))
+
+  # library sizes and dispersions
+  l_n <- runif(N, 1000, 10000)
+  alpha_g <- rexp(G, rate = 0.2)
+
+  # mean expression
+  mean_ng <- (Z %*% W) * l_n
+
+  # gamma-poisson counts
+  X_ng <- matrix(NA_real_, nrow = N, ncol = G)
+  for (g in seq_len(G)) {
+    shape <- alpha_g[g]
+    rate  <- alpha_g[g] / mean_ng[, g]
+    X_ng[, g] <- rgamma(N, shape = shape, rate = rate)
+  }
+  Y_ng <- matrix(rpois(N * G, lambda = as.vector(X_ng)), N, G)
+
+  list(
+    Y = Y_ng,
+    Z = Z,
+    W = W,
+    beta_true = beta_k,
+    diff_topics = diff_k,
+    diff_topic_ids = which(diff_k),
+    X = X,
+    mu = mu_k,
+    alpha_g = alpha_g,
+    library_size = l_n
+  )
+}
+
+## --- 2. One-run CLR + limma ---
+run_one_sim_clr <- function(
+  N = 1000,
+  G = 300,
+  K = 6,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 1
+) {
+  sim <- simulate_topics_dirichlet(
+    N = N, G = G, K = K,
+    frac_diff = frac_diff,
+    beta_strength = beta_strength,
+    seed = seed
+  )
+
+  Z <- sim$Z
+  X_cond <- sim$X
+  true_topics <- sim$diff_topics
+
+  Z_clr <- clr(acomp(Z))
+  colnames(Z_clr) <- paste0("Topic", seq_len(ncol(Z_clr)))
+
+  design <- model.matrix(~ X_cond)
+  fit <- lmFit(t(Z_clr), design)
+  fit <- eBayes(fit)
+
+  res <- topTable(fit, coef = 2, number = Inf)
+  disc <- res$adj.P.Val < 0.05
+
+  list(
+    disc = disc,
+    true_topics = true_topics,
+    pvals = res$P.Value,
+    adj_pvals = res$adj.P.Val,
+    res = res,
+    sim = sim
+  )
+}
+
+## --- 3. Metrics ---
+compute_metrics <- function(disc, true_topics) {
+  power <- if (any(true_topics)) mean(disc[true_topics]) else NA_real_
+
+  n_disc <- sum(disc)
+  emp_fdr <- if (n_disc == 0) {
+    0
+  } else {
+    sum(disc & !true_topics) / n_disc
+  }
+
+  list(power = power, emp_fdr = emp_fdr)
+}
+
+## --- 4. Bootstrap stability on one simulated dataset ---
+stability_for_dataset <- function(sim, B = 50, fdr_thresh = 0.05) {
+  Z <- sim$Z
+  X <- sim$X
+  K <- ncol(Z)
+
+  disc_mat <- matrix(FALSE, nrow = B, ncol = K)
+
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(nrow(Z)), replace = TRUE)
+    Z_b <- Z[idx, , drop = FALSE]
+    X_b <- X[idx]
+
+    Z_clr_b <- clr(acomp(Z_b))
+    design_b <- model.matrix(~ X_b)
+
+    fit_b <- lmFit(t(Z_clr_b), design_b)
+    fit_b <- eBayes(fit_b)
+    res_b <- topTable(fit_b, coef = 2, number = Inf)
+
+    disc_mat[b, ] <- res_b$adj.P.Val < fdr_thresh
+  }
+
+  topic_freq <- colMeans(disc_mat)
+
+  jaccard <- function(a, b) {
+    inter <- sum(a & b)
+    union <- sum(a | b)
+    if (union == 0) return(NA_real_)
+    inter / union
+  }
+
+  pair_ids <- combn(B, 2)
+  jacc_vals <- apply(pair_ids, 2, function(ix) {
+    jaccard(disc_mat[ix[1], ], disc_mat[ix[2], ])
+  })
+
+  list(
+    topic_freq = topic_freq,
+    mean_jacc = mean(jacc_vals, na.rm = TRUE),
+    disc_mat = disc_mat
+  )
+}
+
+## --- 5. Signal scenario across many simulations ---
+run_signal_experiment <- function(
+  R = 100,
+  N = 2000,
+  G = 300,
+  K = 6,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  B = 50
+) {
+  power_vec    <- numeric(R)
+  fdr_vec      <- numeric(R)
+  stab_jaccvec <- numeric(R)
+  stab_avgfreq <- numeric(R)
+
+  for (r in seq_len(R)) {
+    out <- run_one_sim_clr(
+      N = N, G = G, K = K,
+      frac_diff = frac_diff,
+      beta_strength = beta_strength,
+      seed = r
+    )
+
+    m <- compute_metrics(out$disc, out$true_topics)
+    power_vec[r] <- m$power
+    fdr_vec[r]   <- m$emp_fdr
+
+    stab <- stability_for_dataset(out$sim, B = B, fdr_thresh = 0.05)
+    stab_jaccvec[r] <- stab$mean_jacc
+    stab_avgfreq[r] <- mean(stab$topic_freq)
+  }
+
+  list(
+    power_vec = power_vec,
+    fdr_vec = fdr_vec,
+    stab_jaccvec = stab_jaccvec,
+    stab_avgfreq = stab_avgfreq
+  )
+}
+
+## --- 6. Null scenario across many simulations ---
+run_null_experiment <- function(
+  R = 100,
+  N = 2000,
+  G = 300,
+  K = 6,
+  beta_strength = 2
+) {
+  fdr_vec <- numeric(R)
+
+  for (r in seq_len(R)) {
+    out <- run_one_sim_clr(
+      N = N, G = G, K = K,
+      frac_diff = 0.0,
+      beta_strength = beta_strength,
+      seed = r
+    )
+
+    m <- compute_metrics(out$disc, out$true_topics)
+    fdr_vec[r] <- m$emp_fdr
+  }
+
+  fdr_vec
+}
+```
+
+```{r}
+out <- run_one_sim_clr(seed = 11)
+out$res
+out$disc
+out$true_topics
+
+m <- compute_metrics(out$disc, out$true_topics)
+m$power
+m$emp_fdr
+```
+## Signal scenario
+```{r}
+set.seed(999)
+sig_res <- run_signal_experiment(R = 100, B = 50)
+
+cat("=== CLR + limma : SIGNAL scenario ===\n")
+cat("Mean power across sims          =", round(mean(sig_res$power_vec, na.rm = TRUE), 3), "\n")
+cat("Mean empirical FDR across sims  =", round(mean(sig_res$fdr_vec), 3), "\n")
+cat("Mean Jaccard stability          =", round(mean(sig_res$stab_jaccvec, na.rm = TRUE), 3), "\n")
+cat("Mean topic discovery frequency  =", round(mean(sig_res$stab_avgfreq, na.rm = TRUE), 3), "\n")
+```
+
+## null
+```{r}
+set.seed(999)
+null_fdr <- run_null_experiment(R = 100)
+
+cat("=== CLR + limma : NULL scenario ===\n")
+cat("Mean empirical FDR across sims =", round(mean(null_fdr), 3), "\n")
+```
+
+## one dataset
+```{r}
+out1 <- run_one_sim_clr(
+  N = 2000, G = 300, K = 6,
+  frac_diff = 0.4, beta_strength = 2, seed = 123
+)
+
+m1 <- compute_metrics(out1$disc, out1$true_topics)
+stab1 <- stability_for_dataset(out1$sim, B = 50, fdr_thresh = 0.05)
+
+cat("=== CLR + limma : single run ===\n")
+cat("Power =", round(m1$power, 3), "\n")
+cat("Empirical FDR =", round(m1$emp_fdr, 3), "\n")
+cat("Mean Jaccard stability =", round(stab1$mean_jacc, 3), "\n")
+
+topic_summary <- data.frame(
+  Topic = paste0("Topic", seq_along(stab1$topic_freq)),
+  TrueDiff = out1$true_topics,
+  DiscoveryFreq = round(stab1$topic_freq, 3)
+)
+print(topic_summary, row.names = FALSE)
+```
+
