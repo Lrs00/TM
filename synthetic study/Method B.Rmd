@@ -1,0 +1,475 @@
+---
+title: "Method B ILR (standard basis) + linear models"
+output: pdf_document
+date: "2025-10-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Synthetic simulation: condition-dependent topic model
+# ============================================================
+# Description:
+#   Generates single-cell-like counts Y_{ng} under a
+#   Gamma–Poisson (Negative Binomial) model with topic
+#   proportions depending on condition (e.g., drug vs no drug).
+# ============================================================
+
+simulate_topics <- function(
+  N = 1000,        # number of cells
+  G = 500,         # number of genes
+  K = 5,           # number of topics
+  frac_diff = 0.4, # fraction of topics with nonzero beta
+  beta_strength = 2, # effect size for condition-dependent topics
+  seed = 123
+) {
+  set.seed(seed)
+
+  # -------------------------
+  # 1️⃣ Experimental condition
+  # -------------------------
+  X <- rbinom(N, 1, 0.5)  # 0 = control, 1 = drug
+
+  # -------------------------
+  # 2️⃣ Topic-level parameters
+  # -------------------------
+  mu_k   <- rnorm(K, 0, 1)
+  diff_k <- sample(c(TRUE, FALSE), K, replace = TRUE,
+                   prob = c(frac_diff, 1 - frac_diff))
+  beta_k <- ifelse(diff_k, rnorm(K, beta_strength, 0.5), 0)
+  diff_topic_ids <- which(diff_k)
+
+
+  # -------------------------
+  # 3️⃣ Latent topic logits η_{nk}
+  # -------------------------
+  eta <- matrix(NA, N, K)
+  for (k in 1:K) {
+    eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  }
+
+  # -------------------------
+  # 4️⃣ Softmax to get topic proportions z_{nk}
+  # -------------------------
+  softmax <- function(v) exp(v) / sum(exp(v))
+  Z <- t(apply(eta, 1, softmax))  # N x K
+  stopifnot(all(abs(rowSums(Z) - 1) < 1e-8))
+
+  # -------------------------
+  # 5️⃣ Topic–gene weights w_{kg}
+  # -------------------------
+  T_mat <- matrix(rlnorm(K * G, meanlog = 0, sdlog = 1), K, G)
+  W <- t(apply(T_mat, 1, function(v) v / sum(v)))  # normalize rows to sum 1
+
+  # -------------------------
+  # 6️⃣ Library size per cell l_n
+  # -------------------------
+  l_n <- runif(N, 1000, 10000)
+
+  # -------------------------
+  # 7️⃣ Gene-specific dispersion α_g
+  # -------------------------
+  alpha_g <- rexp(G, rate = 0.2)  # mean = 5
+
+  # -------------------------
+  # 8️⃣ Latent mean expression x_{ng}
+  # -------------------------
+  mean_ng <- Z %*% W  # expected fraction per gene (N x G)
+  mean_ng <- mean_ng * l_n  # scale by library size
+
+  # Gamma–Poisson (Negative Binomial)
+  X_ng <- matrix(NA, N, G)
+  for (g in 1:G) {
+    shape <- alpha_g[g]
+    rate  <- alpha_g[g] / mean_ng[, g]
+    X_ng[, g] <- rgamma(N, shape = shape, rate = rate)
+  }
+
+  # -------------------------
+  # 9️⃣ Observed counts Y_{ng}
+  # -------------------------
+  Y_ng <- matrix(rpois(N * G, lambda = as.vector(X_ng)), N, G)
+
+  # -------------------------
+  # 🔟 Return
+  # -------------------------
+  list(
+    Y = Y_ng,          # counts (N x G)
+    Z = Z,             # topic proportions (N x K)
+    W = W,             # topic–gene weights (K x G)
+    beta_true = beta_k,          # true beta per topic
+    diff_topics = diff_k,        # logical: which topics differ
+    diff_topic_ids = diff_topic_ids,  # numeric indices of diff topics
+    X = X,              # condition (0/1)
+    mu = mu_k,
+    alpha_g = alpha_g,
+    library_size = l_n
+  )
+
+  # list(
+  #   Y = Y_ng,          # counts (N x G)
+  #   Z = Z,             # topic proportions (N x K)
+  #   W = W,             # topic–gene weights (K x G)
+  #   beta_true = beta_k,
+  #   diff_topics = diff_k,
+  #   X = X,
+  #   mu = mu_k,
+  #   alpha_g = alpha_g,
+  #   library_size = l_n
+  # )
+}
+
+# ============================================================
+# Example usage
+# ============================================================
+sim <- simulate_topics(N = 800, G = 300, K = 6, frac_diff = 0.5, beta_strength = 2)
+sim$diff_topic_ids
+str(sim)
+summary(rowSums(sim$Y))
+table(sim$diff_topics)
+
+# Example: visualize first few cells’ topic proportions by condition
+boxplot(sim$Z[, 1] ~ sim$X, main = "Topic 1 proportion by condition",
+        names = c("No Drug", "Drug"), ylab = "z_{n1}")
+
+```
+Y — an N×G matrix of observed counts.
+
+Z — an N×K matrix of topic proportions for each cell, which depend on the experimental condition.
+
+W — a K×G matrix of topic–gene weights describing how genes load onto each topic.
+
+beta_true — the true β values for each topic that control how strongly the topic responds to the condition.
+
+diff_topics — a logical vector indicating which topics are condition-dependent (β ≠ 0).
+
+X — the binary condition variable (0 = control, 1 = drug).
+
+library_size — a vector giving the sequencing depth for each cell.
+
+alpha_g — the gene-level dispersion parameter controlling overdispersion in the Gamma–Poisson model.
+
+```{r}
+diff_topics <- sample(K, size = round(frac_diff * K))
+beta_true <- rep(0, K)
+beta_true[diff_topics] <- rnorm(length(diff_topics), mean = beta_strength, sd = 0.2)
+
+```
+
+## Method B
+```{r}
+# Core compositional + modeling packages
+library(compositions)  # for ilr()
+library(limma)         # for moderated linear models
+library(dplyr)
+
+Z_true <- sim$Z        # topic proportions
+X_cond <- sim$X        # condition (0/1)
+K <- ncol(Z_true)
+# ILR
+Z_ilr <- ilr(acomp(Z_true))   # (N × (K-1)) ILR coordinates
+colnames(Z_ilr) <- paste0("ILR", seq_len(K - 1))
+dim(Z_ilr)
+# 
+design <- model.matrix(~ X_cond)
+colnames(design) <- c("Intercept", "ConditionDrug")
+# Fit linear model
+fit <- lmFit(t(Z_ilr), design)   # topics/coordinates in rows, samples in columns
+fit <- eBayes(fit)
+res <- topTable(fit, coef = "ConditionDrug", number = Inf)
+head(res)
+
+
+```
+
+```{r}
+sig <- subset(res, adj.P.Val < 0.05)
+sig
+
+```
+# Z_ILR =log(Z)⋅V, V is basis
+```{r}
+basis <- ilrBase(acomp(Z_true))
+rownames(basis) <- paste0("Topic", seq_len(K))
+colnames(basis) <- paste0("ILR", seq_len(K - 1))
+basis
+
+```
+
+```{r}
+# ============================================================
+# Method B — ILR (standard basis) + linear models
+# ============================================================
+
+library(compositions)  # ilr(), acomp(), ilrBase()
+library(limma)
+library(dplyr)
+library(ggplot2)
+
+# --- 1️⃣ Simulate data --------------------------------------
+sim <- simulate_topics(N = 800, G = 300, K = 6, frac_diff = 0.4, beta_strength = 2)
+Z_true <- sim$Z     # topic proportions
+X_cond <- sim$X     # condition (0 = control, 1 = drug)
+K <- ncol(Z_true)
+
+# --- 2️⃣ ILR transform --------------------------------------
+Z_ilr <- ilr(acomp(Z_true))
+colnames(Z_ilr) <- paste0("ILR", seq_len(K - 1))
+
+# --- 3️⃣ Design matrix --------------------------------------
+design <- model.matrix(~ X_cond)
+colnames(design) <- c("Intercept", "ConditionDrug")
+
+# --- 4️⃣ Fit moderated linear models ------------------------
+fit <- lmFit(t(Z_ilr), design)
+fit <- eBayes(fit)
+res <- topTable(fit, coef = "ConditionDrug", number = Inf)
+print(res)
+
+# --- 5️⃣ Identify significant ILR coordinates ---------------
+sig <- subset(res, adj.P.Val < 0.05)
+sig
+
+# --- 6️⃣ Interpret back in topic space -----------------------
+basis <- ilrBase(acomp(Z_true))
+rownames(basis) <- paste0("Topic", seq_len(K))
+colnames(basis) <- paste0("ILR", seq_len(K - 1))
+basis
+
+# Interpretation guide:
+# Each column = ILR coordinate (balance)
+# Positive weights  → topics in numerator of that balance
+# Negative weights → topics in denominator
+
+```
+```{r}
+plot_df <- data.frame(
+  Condition = factor(X_cond, labels = c("No Drug", "Drug")),
+  ILR1 = Z_ilr[, 1]
+)
+
+ggplot(plot_df, aes(x = Condition, y = ILR1, fill = Condition)) +
+  geom_boxplot(alpha = 0.6) +
+  labs(title = "ILR₁ coordinate by condition",
+       y = "ILR₁ (log-ratio balance)") +
+  theme_classic()
+
+```
+```{r}
+library(vegan)
+
+# PERMANOVA using Euclidean distances in ILR space
+perm_global <- adonis2(Z_ilr ~ X_cond, method = "euclidean")
+perm_global
+
+```
+
+```{r}
+manova_res <- manova(Z_ilr ~ X_cond)
+summary(manova_res, test = "Wilks")
+
+```
+
+```{r}
+# Number of significant ILR coordinates at FDR < 0.05
+n_disc <- sum(res$adj.P.Val < 0.05)
+n_disc
+
+# Which coordinates were discovered
+sig_coords <- rownames(res)[res$adj.P.Val < 0.05]
+sig_coords
+
+
+```
+```{r}
+library(compositions)
+library(limma)
+
+run_methodB <- function(Z, X, fdr = 0.05) {
+  K <- ncol(Z)
+  Z_ilr <- ilr(acomp(Z))
+  design <- model.matrix(~ X)                 # Intercept + condition
+  fit <- lmFit(t(Z_ilr), design) |> eBayes()
+  tt  <- topTable(fit, coef = 2, number = Inf)  # coef=2 is the condition term
+
+  # per-coordinate discoveries at FDR q
+  disc_idx <- which(tt$adj.P.Val < fdr)
+  disc_names <- rownames(tt)[disc_idx]
+
+  # ILR basis for interpretation (topics × ILR coords)
+  basis <- ilrBase(acomp(Z))
+  rownames(basis) <- paste0("Topic", seq_len(K))
+  colnames(basis) <- paste0("ILR", seq_len(K-1))
+
+  list(
+    Z_ilr = Z_ilr,
+    design = design,
+    fit = fit,
+    table = tt,
+    n_disc = length(disc_idx),
+    disc_names = disc_names,
+    basis = basis
+  )
+}
+
+```
+
+```{r}
+out <- run_methodB(sim$Z, sim$X, fdr = 0.05)
+out$n_disc
+out$disc_names
+out$basis
+
+```
+```{r}
+global_tests <- function(Z_ilr, X) {
+  res <- list()
+  if (!requireNamespace("vegan", quietly = TRUE))
+    stop("Install 'vegan' for PERMANOVA: install.packages('vegan')")
+  res$permanova <- vegan::adonis2(Z_ilr ~ X, method = "euclidean")
+  res$manova    <- summary(manova(Z_ilr ~ X), test = "Wilks")
+  res
+}
+g <- global_tests(out$Z_ilr, sim$X)
+g$permanova      # global p-value
+g$manova
+
+```
+## 3) Stability under resampling (bootstrap cells)
+```{r}
+stability_methodB <- function(Z, X, fdr = 0.05, B = 50, seed = 1) {
+  set.seed(seed)
+  K <- ncol(Z); p <- K - 1
+  stab <- numeric(p)
+
+  for (b in 1:B) {
+    idx <- sample(seq_len(nrow(Z)), replace = TRUE)
+    ob  <- run_methodB(Z[idx, , drop=FALSE], X[idx], fdr = fdr)
+    sig <- rep(0L, p); names(sig) <- rownames(ob$table)
+    sig[ob$disc_names] <- 1L
+    stab <- stab + sig
+  }
+  stab / B  # fraction of bootstraps where each ILR coordinate is significant
+}
+
+stab <- stability_methodB(sim$Z, sim$X, fdr = 0.05, B = 50)
+# # names (ILR indices)
+names(stab) <- paste0("ILR", seq_along(stab))
+stab
+
+
+```
+
+
+
+```{r}
+sim_null <- simulate_topics(N = 800, G = 300, K = 6, frac_diff = 0.0, beta_strength = 0)
+Z_ilr_null <- ilr(acomp(sim_null$Z))
+
+design_null <- model.matrix(~ sim_null$X)
+fit_null <- lmFit(t(Z_ilr_null), design_null) |> eBayes()
+res_null <- topTable(fit_null, coef = "sim_null$X1", number = Inf)
+
+hist(res_null$P.Value, breaks = 30,
+     main = "Type I calibration under null",
+     xlab = "p-value")
+mean(res_null$adj.P.Val < 0.05)   # empirical false-positive rate
+
+```
+
+## 4) Type I error calibration (null sims) and Power
+```{r}
+# assumes your simulate_topics() is in scope
+# If there’s no difference between conditions, how often does Method B report a significant ILR coordinate
+type1_calibration <- function(R = 200, N = 800, G = 300, K = 6, fdr = 0.05) {
+  fp <- numeric(R)
+  for (r in 1:R) {
+    sim0 <- simulate_topics(N=N, G=G, K=K, frac_diff=0, beta_strength=0,seed = r)
+    tt0  <- run_methodB(sim0$Z, sim0$X, fdr=fdr)$table
+    fp[r] <- mean(tt0$adj.P.Val < fdr)
+  }
+  list(mean_fp = mean(fp), fp = fp)
+}
+# When there is a true signal, how often does Method B detect it?
+power_estimate <- function(R = 200, N = 800, G = 300, K = 6,
+                           frac_diff = 0.5, beta_strength = 2, fdr = 0.05) {
+  det_any <- logical(R)
+  for (r in 1:R) {
+    sim1 <- simulate_topics(N=N, G=G, K=K,
+                            frac_diff=frac_diff, beta_strength=beta_strength,seed = r)
+
+    out1 <- run_methodB(sim1$Z, sim1$X, fdr=fdr)
+    det_any[r] <- out1$n_disc > 0
+  }
+  list(power = mean(det_any), detect_any = det_any)
+}
+
+# Type I calibration (should be near 0.05 if well-calibrated)
+t1 <- type1_calibration(R = 100)
+t1$mean_fp
+
+# Power at a given effect size
+pw <- power_estimate(R = 2, frac_diff = 0.5, beta_strength = 2)
+pw$power
+
+```
+
+5) Quick p-value diagnostic plot (null)
+```{r}
+plot_pvals_null <- function(R = 200, N = 800, G = 300, K = 6) {
+  sim0 <- simulate_topics(N=N, G=G, K=K, frac_diff=0, beta_strength=0)
+  tt0  <- run_methodB(sim0$Z, sim0$X)$table
+  hist(tt0$P.Value, breaks = 30, main = "Null p-values (Method B)",
+       xlab = "p-value")
+}
+plot_pvals_null()
+
+```
+```{r}
+out <- run_methodB(sim$Z, sim$X, fdr = 0.05)
+g   <- global_tests(out$Z_ilr, sim$X)
+stab <- stability_methodB(sim$Z, sim$X, B = 50)
+
+out$n_disc
+g$permanova
+stab
+
+```
+
+
+```{r}
+n_sim <- 100
+detect_any <- logical(n_sim)
+
+for (i in seq_len(n_sim)) {
+  sim_i <-simulate_topics(N = 800, G = 300, K = 6, frac_diff = 0.5, beta_strength = 2)
+  Z_ilr_i <- ilr(acomp(sim_i$Z))
+  design_i <- model.matrix(~ sim_i$X)
+  fit_i <- lmFit(t(Z_ilr_i), design_i) |> eBayes()
+  res_i <- topTable(fit_i, coef = 2, number = Inf)
+  detect_any[i] <- any(res_i$adj.P.Val < 0.05)
+}
+
+mean(detect_any)  # estimated power
+
+```
+
+```{r}
+set.seed(1)
+boot_ids <- replicate(50, sample(seq_len(nrow(Z_ilr)), replace = TRUE), simplify = FALSE)
+
+stable_counts <- sapply(boot_ids, function(idx) {
+  fit_b <- lmFit(t(Z_ilr[idx, ]), design[idx, , drop = FALSE]) |> eBayes()
+  res_b <- topTable(fit_b, coef = 2, number = Inf)
+  as.integer(res_b$adj.P.Val < 0.05)
+})
+
+# Stability: fraction of bootstraps where each coordinate is significant
+stability <- rowMeans(stable_counts)
+stability
+
+```
+
