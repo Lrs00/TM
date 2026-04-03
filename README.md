@@ -12,6 +12,6 @@
 - `RNA2.1`: Logit-based analysis with and without cell state
 - `RNA3.2`: Log pairwise analysis with cell state
 - `RNA5.1`: Log pairwise analysis without cell state
-- `RNA6.2`: Comparison of nonparametric epb, limma, ASH, and non-EB methods for log pairwise analysis
+- `RNA6.3`: Comparison of nonparametric epb, limma, ASH, and non-EB methods for log pairwise analysis
 - `GomDE_Cancer1`: GoMDE analysis
 
