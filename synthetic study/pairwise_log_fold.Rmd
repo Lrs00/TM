@@ -1,0 +1,904 @@
+---
+title: "Pair_wise_log"
+output: pdf_document
+date: "2025-11-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# pairwise log fold
+## ture topic =2 for k =6, 9, 15, 30
+```{r}
+library(MCMCpack)
+library(MASS)
+library(fastTopics)
+library(limma)
+library(clue)
+
+# ----------------------------------------------------------
+# Distance and error utilities
+# ----------------------------------------------------------
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1*v2) /
+                 (sqrt(sum(v1^2)*sum(v2^2)) + 1e-20)
+      D[k,j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(
+    mean_error = mean(diffs),
+    max_error  = max(diffs)
+  )
+}
+
+# --------------------------------------------------
+# FIXED mapping: K → number of DE topics
+# --------------------------------------------------
+K_values <- c(6, 9, 15, 30)
+diff_map <- c(`6`=2, `9`=2, `15`=2, `30`=2)
+
+nsim <- 20
+
+# separate containers for BH and BY
+all_results_BH5 <- list()
+all_results_BY5 <- list()
+row_BH <- 1
+row_BY <- 1
+
+set.seed(999)
+
+# =====================================================
+#                  MAIN SIMULATION LOOP
+# =====================================================
+for (K in K_values) {
+
+  n_diff <- diff_map[as.character(K)]
+  cat("\n=========================================\n")
+  cat("Running K =", K, "| n_diff =", n_diff, "\n")
+  cat("=========================================\n")
+
+  for (sim in 1:nsim) {
+
+    N <- 1000; G <- 500
+    beta_strength <- 2
+    set.seed(100 + sim)
+
+    # Condition
+    X <- rbinom(N, 1, 0.5)
+
+    # True latent effects
+    mu_k <- rnorm(K, 0, 1)
+
+    diff_k <- rep(FALSE, K)
+    diff_idx <- sample(1:K, n_diff)
+    diff_k[diff_idx] <- TRUE
+
+    beta_k <- ifelse(diff_k, rnorm(K, mean=beta_strength, sd=0.5), 0)
+
+    # Logits and topic intensities
+    eta <- sapply(1:K, function(k)
+      rnorm(N, mu_k[k] + X*beta_k[k], 1)
+    )
+    E <- exp(eta)
+
+    # True W (topic–gene)
+    T_mat <- matrix(rlnorm(K*G, 0, 1), K, G)
+    W_true <- t(apply(T_mat, 1, function(a) rdirichlet(1, a)))
+
+    # Counts
+    l_n <- runif(N, 1000, 10000)
+    mean_ng <- (E %*% W_true) * l_n
+    Y_ng <- matrix(rpois(N*G, lambda=as.vector(mean_ng)), N, G)
+
+    # ----------------------------------------------------
+    # Fit fastTopics and get θ (topic proportions) & β
+    # ----------------------------------------------------
+    fit <- fit_poisson_nmf(Y_ng, k=K, numiter=200, verbose="none")
+    fit_multinom <- poisson2multinom(fit)
+    theta_hat <- fit_multinom$L    # N × K
+    beta_hat  <- fit_multinom$F    # G × K
+
+    # ----------------------------------------------------
+    # Alignment step (Hungarian on W_true vs β)
+    # ----------------------------------------------------
+    D <- compute_distance_matrix(W_true, t(beta_hat))
+    assignment <- solve_LSAP(D)
+
+    beta_hat_aligned  <- beta_hat[, assignment]   # G × K
+    theta_hat_aligned <- theta_hat[, assignment]  # N × K
+
+    W_est_aligned <- t(beta_hat_aligned)          # K × G
+
+    # Topic estimation error (W_true ≈ W_est_aligned)
+    err <- compute_topic_error(W_true, W_est_aligned)
+
+    # ====================================================
+    #  Pairwise log-ratio limma on θ (PAIR-LEVEL METRICS)
+    # ====================================================
+    eps <- 1e-8
+
+    # All unordered topic pairs (k < l), total = choose(K, 2)
+    pair_mat <- t(combn(K, 2))    # each row: (k, l)
+    n_pairs  <- nrow(pair_mat)
+
+    # N × n_pairs matrix of log-ratios per cell
+    log_ratio_mat <- matrix(NA_real_, nrow=N, ncol=n_pairs)
+
+    for (p in 1:n_pairs) {
+      k1 <- pair_mat[p, 1]
+      k2 <- pair_mat[p, 2]
+      log_ratio_mat[, p] <-
+        log(theta_hat_aligned[, k1] + eps) -
+        log(theta_hat_aligned[, k2] + eps)
+    }
+
+    colnames(log_ratio_mat) <-
+      apply(pair_mat, 1, function(idx) paste0("T", idx[1], "_vs_T", idx[2]))
+
+    # Build design for limma
+    design <- model.matrix(~ X)
+
+    # limma expects features × samples
+    LR_for_limma <- t(log_ratio_mat)   # n_pairs × N
+
+    fitL <- lmFit(LR_for_limma, design)
+    fitL <- eBayes(fitL)
+
+    # p-values for the condition effect (2nd coefficient)
+    pvals_pairs <- fitL$p.value[, 2]
+
+    # ----------------------------------------------------
+    # Pair-level TRUTH: pair is DE iff exactly ONE topic is DE
+    # (DE vs non-DE = alternative, DE vs DE = null, nonDE vs nonDE = null)
+    # ----------------------------------------------------
+    pair_truth <- apply(pair_mat, 1, function(idx) {
+      k1 <- idx[1]; k2 <- idx[2]
+      diff_k[k1] != diff_k[k2]    # xor
+    })
+
+    # =========================
+    #  BH-adjusted metrics
+    # =========================
+    qvals_BH <- p.adjust(pvals_pairs, method = "BH")
+    detected_BH_pairs <- qvals_BH < 0.05
+
+    TP_BH <- sum(detected_BH_pairs & pair_truth)
+    FP_BH <- sum(detected_BH_pairs & !pair_truth)
+
+    Power_BH <- TP_BH / sum(pair_truth)
+    FDP_BH   <- ifelse(sum(detected_BH_pairs) == 0, 0, FP_BH / sum(detected_BH_pairs))
+
+    all_results_BH5[[row_BH]] <- data.frame(
+      Adjust = "BH",
+      K = K,
+      n_diff = n_diff,
+      sim = sim,
+      TP_pairs = TP_BH,
+      FP_pairs = FP_BH,
+      Power_pairs = Power_BH,
+      FDP_pairs = FDP_BH,
+      mean_err = err$mean_error,
+      max_err  = err$max_error
+    )
+    row_BH <- row_BH + 1
+
+    # =========================
+    #  BY-adjusted metrics
+    # =========================
+    qvals_BY <- p.adjust(pvals_pairs, method = "BY")
+    detected_BY_pairs <- qvals_BY < 0.05
+
+    TP_BY <- sum(detected_BY_pairs & pair_truth)
+    FP_BY <- sum(detected_BY_pairs & !pair_truth)
+
+    Power_BY <- TP_BY / sum(pair_truth)
+    FDP_BY   <- ifelse(sum(detected_BY_pairs) == 0, 0, FP_BY / sum(detected_BY_pairs))
+
+    all_results_BY5[[row_BY]] <- data.frame(
+      Adjust = "BY",
+      K = K,
+      n_diff = n_diff,
+      sim = sim,
+      TP_pairs = TP_BY,
+      FP_pairs = FP_BY,
+      Power_pairs = Power_BY,
+      FDP_pairs = FDP_BY,
+      mean_err = err$mean_error,
+      max_err  = err$max_error
+    )
+    row_BY <- row_BY + 1
+  }
+}
+
+output_BH5 <- do.call(rbind, all_results_BH5)
+output_BY5 <- do.call(rbind, all_results_BY5)
+
+output_BH5
+output_BY5
+
+```
+```{r}
+ggplot(output_BY5, aes(mean_err, FDP_pairs)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Mean topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K) -- BY"
+  )
+
+
+ggplot(output_BY5, aes(max_err, FDP_pairs)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Max topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K) --BY"
+  )
+
+ggplot(output_BY5, aes(x = factor(K), y = FDP_pairs, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max topic error",
+    title = "FDP vs K (colored by topic-model estimation error) -- BY"
+  )
+
+ggplot(output_BY5, aes(x = factor(K), y = Power_pairs, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "Power",
+    color = "Mean topic error",
+    title = "Power vs K (colored by topic-model estimation error) --BY "
+  )
+```
+```{r}
+ggplot(output_BH5, aes(mean_err, FDP_pairs)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Mean topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K) -- BH"
+  )
+
+
+ggplot(output_BH5, aes(max_err, FDP_pairs)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Max topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K) --BH"
+  )
+
+ggplot(output_BH5, aes(x = factor(K), y = FDP_pairs, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max topic error",
+    title = "FDP vs K (colored by topic-model estimation error) -- BH"
+  )
+
+ggplot(output_BH5, aes(x = factor(K), y = Power_pairs, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "Power",
+    color = "Mean topic error",
+    title = "Power vs K (colored by topic-model estimation error) --BH "
+  )
+```
+
+
+## true topic= 2,3,5,10 for k=6, 9, 15, 30
+```{r}
+library(MCMCpack)
+library(MASS)
+library(fastTopics)
+library(limma)
+library(clue)
+
+# ----------------------------------------------------------
+# Distance and error utilities
+# ----------------------------------------------------------
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1*v2) /
+                 (sqrt(sum(v1^2)*sum(v2^2)) + 1e-20)
+      D[k,j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(
+    mean_error = mean(diffs),
+    max_error  = max(diffs)
+  )
+}
+
+# --------------------------------------------------
+# FIXED mapping: K → number of DE topics
+# --------------------------------------------------
+K_values <- c(6, 9, 15, 30)
+diff_map <- c(`6`=2, `9`=3, `15`=5, `30`=10)
+
+nsim <- 20
+
+all_results5 <- list()
+row_id <- 1
+
+set.seed(999)
+
+# =====================================================
+#                  MAIN SIMULATION LOOP
+# =====================================================
+for (K in K_values) {
+
+  n_diff <- diff_map[as.character(K)]
+  cat("\n=========================================\n")
+  cat("Running K =", K, "| n_diff =", n_diff, "\n")
+  cat("=========================================\n")
+
+  for (sim in 1:nsim) {
+
+    N <- 1000; G <- 500
+    beta_strength <- 2
+    set.seed(100 + sim)
+
+    # Condition
+    X <- rbinom(N, 1, 0.5)
+
+    # True latent effects
+    mu_k <- rnorm(K, 0, 1)
+
+    diff_k <- rep(FALSE, K)
+    diff_idx <- sample(1:K, n_diff)
+    diff_k[diff_idx] <- TRUE
+
+    beta_k <- ifelse(diff_k, rnorm(K, mean=beta_strength, sd=0.5), 0)
+
+    # Logits and topic intensities
+    eta <- sapply(1:K, function(k)
+      rnorm(N, mu_k[k] + X*beta_k[k], 1)
+    )
+    E <- exp(eta)
+
+    # True W (topic–gene)
+    T_mat <- matrix(rlnorm(K*G, 0, 1), K, G)
+    W_true <- t(apply(T_mat, 1, function(a) rdirichlet(1, a)))
+
+    # Counts
+    l_n <- runif(N, 1000, 10000)
+    mean_ng <- (E %*% W_true) * l_n
+    Y_ng <- matrix(rpois(N*G, lambda=as.vector(mean_ng)), N, G)
+
+    # ----------------------------------------------------
+    # Fit fastTopics and get θ (topic proportions) & β
+    # ----------------------------------------------------
+    fit <- fit_poisson_nmf(Y_ng, k=K, numiter=200, verbose="none")
+    fit_multinom <- poisson2multinom(fit)
+    theta_hat <- fit_multinom$L    # N × K
+    beta_hat  <- fit_multinom$F    # G × K
+
+    # ----------------------------------------------------
+    # Alignment step (Hungarian on W_true vs β)
+    # ----------------------------------------------------
+    D <- compute_distance_matrix(W_true, t(beta_hat))
+    assignment <- solve_LSAP(D)
+
+    beta_hat_aligned  <- beta_hat[, assignment]   # G × K
+    theta_hat_aligned <- theta_hat[, assignment]  # N × K
+
+    W_est_aligned <- t(beta_hat_aligned)          # K × G
+
+    # Topic estimation error (W_true ≈ W_est_aligned)
+    err <- compute_topic_error(W_true, W_est_aligned)
+
+    # ====================================================
+    #  Pairwise log-ratio limma on θ (PAIR-LEVEL METRICS)
+    # ====================================================
+    eps <- 1e-8
+
+    # All unordered topic pairs (k < l), total = choose(K, 2)
+    pair_mat <- t(combn(K, 2))    # each row: (k, l)
+    n_pairs  <- nrow(pair_mat)
+
+    # N × n_pairs matrix of log-ratios per cell
+    log_ratio_mat <- matrix(NA_real_, nrow=N, ncol=n_pairs)
+
+    for (p in 1:n_pairs) {
+      k1 <- pair_mat[p, 1]
+      k2 <- pair_mat[p, 2]
+      log_ratio_mat[, p] <-
+        log(theta_hat_aligned[, k1] + eps) -
+        log(theta_hat_aligned[, k2] + eps)
+    }
+
+    colnames(log_ratio_mat) <-
+      apply(pair_mat, 1, function(idx) paste0("T", idx[1], "_vs_T", idx[2]))
+
+    # Build design for limma
+    design <- model.matrix(~ X)
+
+    # limma expects features × samples
+    LR_for_limma <- t(log_ratio_mat)   # n_pairs × N
+
+    fitL <- lmFit(LR_for_limma, design)
+    fitL <- eBayes(fitL)
+
+    # p-values for the condition effect (2nd coefficient)
+    pvals_pairs <- fitL$p.value[, 2]
+    qvals_pairs <- p.adjust(pvals_pairs, method="BH")
+
+    detected_pairs <- qvals_pairs < 0.05
+
+    # ----------------------------------------------------
+    # Pair-level TRUTH: a pair is DE if at least one topic is DE
+    # ----------------------------------------------------
+    # pair_truth <- apply(pair_mat, 1, function(idx) {
+    #   k1 <- idx[1]; k2 <- idx[2]
+    #   diff_k[k1] | diff_k[k2]
+    # })
+    pair_truth <- apply(pair_mat, 1, function(idx) {
+      k1 <- idx[1]; k2 <- idx[2]
+      diff_k[k1] != diff_k[k2]      # TRUE iff exactly one is DE
+    })
+
+
+
+    # Pair-level metrics
+    TP_pair <- sum(detected_pairs & pair_truth)
+    FP_pair <- sum(detected_pairs & !pair_truth)
+
+    Power_pair <- TP_pair / sum(pair_truth)
+    FDP_pair   <- ifelse(sum(detected_pairs) == 0, 0, FP_pair / sum(detected_pairs))
+
+    all_results5[[row_id]] <- data.frame(
+      K = K,
+      n_diff = n_diff,
+      sim = sim,
+      TP_pairs = TP_pair,
+      FP_pairs = FP_pair,
+      Power_pairs = Power_pair,
+      FDP_pairs = FDP_pair,
+      mean_err = err$mean_error,
+      max_err  = err$max_error
+    )
+    row_id <- row_id + 1
+  }
+}
+
+output5 <- do.call(rbind, all_results5)
+output5
+
+```
+
+```{r}
+ggplot(output5, aes(mean_err, FDP_pairs)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Mean topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K) -- BH"
+  )
+
+
+ggplot(output5, aes(max_err, FDP_pairs)) +
+  geom_point() +
+  geom_smooth(method="loess", se=FALSE) +
+  theme_bw() +
+  facet_wrap(~ K, scales="free") +
+  labs(
+    x = "Max topic estimation error",
+    y = "FDP",
+    title = "Topic-model error vs FDP (per K) --BH"
+  )
+
+ggplot(output5, aes(x = factor(K), y = FDP_pairs, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "FDP",
+    color = "Max topic error",
+    title = "FDP vs K (colored by topic-model estimation error) -- BH"
+  )
+
+ggplot(output5, aes(x = factor(K), y = Power_pairs, color = mean_err)) +
+  geom_jitter(width = 0.15, height = 0, size = 3, alpha = 0.8) +
+  scale_color_viridis_c(option = "B") +
+  theme_bw() +
+  labs(
+    x = "Number of topics (K)",
+    y = "Power",
+    color = "Mean topic error",
+    title = "Power vs K (colored by topic-model estimation error) --BH "
+  )
+```
+
+```{r}
+library(MCMCpack)
+library(MASS)
+library(fastTopics)
+library(limma)
+library(clue)
+
+# ----------------------------------------------------------
+# Distance and error utilities
+# ----------------------------------------------------------
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1*v2) /
+                 (sqrt(sum(v1^2)*sum(v2^2)) + 1e-20)
+      D[k,j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(
+    mean_error = mean(diffs),
+    max_error  = max(diffs)
+  )
+}
+
+# --------------------------------------------------
+# FIXED mapping: K → number of DE topics
+# --------------------------------------------------
+# K_values <- c(6, 9, 15, 30)
+K_values <- c(6)
+diff_map <- c(`6`=2, `9`=3, `15`=5, `30`=10)
+
+nsim <- 1   # adjust if needed
+
+all_results5 <- list()
+row_id <- 1
+
+set.seed(999)
+
+# =====================================================
+#                  MAIN SIMULATION LOOP
+# =====================================================
+for (K in K_values) {
+
+  n_diff <- diff_map[as.character(K)]
+  cat("\n=========================================\n")
+  cat("Running K =", K, "| n_diff =", n_diff, "\n")
+  cat("=========================================\n")
+
+  for (sim in 1:nsim) {
+
+    N <- 1000; G <- 500
+    beta_strength <- 2
+    set.seed(100 + sim)
+
+    # Condition
+    X <- rbinom(N, 1, 0.5)
+
+    # True latent effects
+    mu_k <- rnorm(K, 0, 1)
+
+    diff_k <- rep(FALSE, K)
+    diff_idx <- sample(1:K, n_diff)
+    diff_k[diff_idx] <- TRUE
+
+    beta_k <- ifelse(diff_k, rnorm(K, mean=beta_strength, sd=0.5), 0)
+
+    # Logits and topic intensities
+    eta <- sapply(1:K, function(k)
+      rnorm(N, mu_k[k] + X*beta_k[k], 1)
+    )
+    E <- exp(eta)
+
+    # True W (topic–gene)
+    T_mat <- matrix(rlnorm(K*G, 0, 1), K, G)
+    W_true <- t(apply(T_mat, 1, function(a) rdirichlet(1, a)))
+
+    # Counts
+    l_n <- runif(N, 1000, 10000)
+    mean_ng <- (E %*% W_true) * l_n
+    Y_ng <- matrix(rpois(N*G, lambda=as.vector(mean_ng)), N, G)
+
+    # ----------------------------------------------------
+    # Fit fastTopics and get θ (topic proportions) & β
+    # ----------------------------------------------------
+    fit <- fit_poisson_nmf(Y_ng, k=K, numiter=200, verbose="none")
+    fit_multinom <- poisson2multinom(fit)
+    theta_hat <- fit_multinom$L    # N × K
+    beta_hat  <- fit_multinom$F    # G × K
+
+    # ----------------------------------------------------
+    # Alignment step (Hungarian on W_true vs β)
+    # ----------------------------------------------------
+    D <- compute_distance_matrix(W_true, t(beta_hat))
+    assignment <- solve_LSAP(D)
+
+    beta_hat_aligned  <- beta_hat[, assignment]   # G × K
+    theta_hat_aligned <- theta_hat[, assignment]  # N × K
+
+    W_est_aligned <- t(beta_hat_aligned)          # K × G
+
+    # Topic estimation error (W_true ≈ W_est_aligned)
+    err <- compute_topic_error(W_true, W_est_aligned)
+
+    # ====================================================
+    #  NEW: Pairwise log-ratio limma on θ
+    # ====================================================
+    eps <- 1e-8
+
+    # All unordered topic pairs (k < l)
+    pair_mat <- t(combn(K, 2))    # each row: (k, l)
+    n_pairs  <- nrow(pair_mat)
+
+    # N × n_pairs matrix of log-ratios per cell
+    log_ratio_mat <- matrix(NA_real_, nrow=N, ncol=n_pairs)
+
+    for (p in 1:n_pairs) {
+      k1 <- pair_mat[p, 1]
+      k2 <- pair_mat[p, 2]
+      log_ratio_mat[, p] <-
+        log(theta_hat_aligned[, k1] + eps) -
+        log(theta_hat_aligned[, k2] + eps)
+    }
+
+    colnames(log_ratio_mat) <-
+      apply(pair_mat, 1, function(idx) paste0("T", idx[1], "_vs_T", idx[2]))
+
+    # Build design for limma
+    design <- model.matrix(~ X)
+
+    # limma expects features × samples
+    LR_for_limma <- t(log_ratio_mat)   # n_pairs × N
+
+    fitL <- lmFit(LR_for_limma, design)
+    fitL <- eBayes(fitL)
+
+    # p-values for the condition effect (2nd coefficient)
+    pvals_pairs <- fitL$p.value[, 2]
+    qvals_pairs <- p.adjust(pvals_pairs, method="BH")
+
+    detected_pairs <- qvals_pairs < 0.05
+
+    # Map pair-level detections back to topic-level detections:
+    # A topic is "detected" if any pair involving it is detected.
+    detected_topics <- rep(FALSE, K)
+    for (p in which(detected_pairs)) {
+      k1 <- pair_mat[p, 1]
+      k2 <- pair_mat[p, 2]
+      detected_topics[c(k1, k2)] <- TRUE
+    }
+
+    # ----------------------------------------------------
+    # Topic-level Power & FDP (as before)
+    # ----------------------------------------------------
+    TP  <- sum(detected_topics & diff_k)
+    FP  <- sum(detected_topics & !diff_k)
+
+    Power <- TP / n_diff
+    FDP   <- ifelse(sum(detected_topics) == 0, 0, FP / sum(detected_topics))
+
+    all_results5[[row_id]] <- data.frame(
+      K = K,
+      n_diff = n_diff,
+      sim = sim,
+      TP = TP,
+      FP = FP,
+      Power = Power,
+      FDP = FDP,
+      mean_err = err$mean_error,
+      max_err  = err$max_error
+    )
+    row_id <- row_id + 1
+  }
+}
+
+output5 <- do.call(rbind, all_results5)
+output5
+
+```
+
+
+```{r}
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1*v2) /
+                 (sqrt(sum(v1^2)*sum(v2^2)) + 1e-20)
+      D[k,j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(
+    mean_error = mean(diffs),
+    max_error  = max(diffs)
+  )
+}
+
+# --------------------------------------------------
+# FIXED mapping: K → number of DE topics
+# --------------------------------------------------
+K_values <- c(6, 9, 15, 30)
+diff_map <- c(`6`=2, `9`=3, `15`=5, `30`=10)
+
+nsim <- 20   # adjust if needed
+
+all_results1 <- list()
+row_id <- 1
+
+set.seed(999)
+
+# =====================================================
+#                  MAIN SIMULATION LOOP
+# =====================================================
+for (K in K_values) {
+
+  n_diff <- diff_map[as.character(K)]
+  cat("\n=========================================\n")
+  cat("Running K =", K, "| n_diff =", n_diff, "\n")
+  cat("=========================================\n")
+
+  for (sim in 1:nsim) {
+
+    N <- 1000; G <- 500
+    beta_strength <- 2
+    set.seed(100 + sim)
+
+    # Condition
+    X <- rbinom(N, 1, 0.5)
+
+    # True latent effects
+    mu_k <- rnorm(K, 0, 1)
+
+    diff_k <- rep(FALSE, K)
+    diff_idx <- sample(1:K, n_diff)
+    diff_k[diff_idx] <- TRUE
+
+    beta_k <- ifelse(diff_k, rnorm(K, mean=beta_strength, sd=0.5), 0)
+
+    # Logits and topic intensities
+    eta <- sapply(1:K, function(k)
+      rnorm(N, mu_k[k] + X*beta_k[k], 1)
+    )
+    E <- exp(eta)
+
+    # True W
+    T_mat <- matrix(rlnorm(K*G, 0, 1), K, G)
+    W_true <- t(apply(T_mat, 1, function(a) rdirichlet(1, a)))
+
+    # Counts
+    l_n <- runif(N, 1000, 10000)
+    mean_ng <- (E %*% W_true) * l_n
+    Y_ng <- matrix(rpois(N*G, lambda=as.vector(mean_ng)), N, G)
+
+    # Fit fastTopics
+    fit <- fit_poisson_nmf(Y_ng, k=K, numiter=200, verbose="none")
+    fit_multinom <- poisson2multinom(fit)
+    beta_hat  <- fit_multinom$F
+
+    # ---------------------------------------------
+    # Alignment step
+    # ---------------------------------------------
+    D <- compute_distance_matrix(W_true, t(beta_hat))
+    assignment <- solve_LSAP(D)
+    beta_hat <- beta_hat[, assignment]
+    W_est_aligned <- t(beta_hat)
+
+    # Topic estimation error
+    err <- compute_topic_error(W_true, W_est_aligned)
+
+    # ---------------------------------------------
+    # Per-cell Poisson GLM to recover activity
+    # ---------------------------------------------
+    W_est <- matrix(NA_real_, nrow=N, ncol=K)
+    for (ii in 1:N) {
+      y_i <- Y_ng[ii, ]
+      X_i <- l_n[ii] * beta_hat
+
+      df_i <- data.frame(y=y_i, X_i)
+      colnames(df_i) <- c("y", paste0("B",1:K))
+
+      form_i <- as.formula(
+        paste("y ~", paste(colnames(df_i)[-1], collapse=" + "), "- 1")
+      )
+
+      fit_i <- try(
+        glm(form_i, data=df_i, family=poisson(link="identity"),
+            start=rep(mean(y_i)/K, K)),
+        silent=TRUE
+      )
+
+      coef_i <- if (inherits(fit_i, "try-error")) rep(0,K) else coef(fit_i)
+      W_est[ii,] <- pmax(coef_i, 0)
+    }
+
+    # limma test
+    W_log <- log(W_est + 1e-8)
+    fitL <- lmFit(t(W_log), model.matrix(~ X))
+    fitL <- eBayes(fitL)
+    tt <- topTable(fitL, coef=2, number=Inf, sort.by="none")
+    detected <- p.adjust(tt$P.Value, "BH") < 0.05
+
+    # Metrics
+    TP  <- sum(detected & diff_k)
+    FP  <- sum(detected & !diff_k)
+    Power <- TP / n_diff
+    FDP   <- ifelse(sum(detected)==0, 0, FP / sum(detected))
+
+    all_results1[[row_id]] <- data.frame(
+      K = K,
+      n_diff = n_diff,
+      sim = sim,
+      TP = TP,
+      FP = FP,
+      Power = Power,
+      FDP = FDP,
+      mean_err = err$mean_error,
+      max_err  = err$max_error
+    )
+    row_id <- row_id + 1
+  }
+}
+
+output1 <- do.call(rbind, all_results1)
+output1
+```
+
