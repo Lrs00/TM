@@ -1,0 +1,537 @@
+---
+title: "RNA6.3"
+output: pdf_document
+date: "2026-03-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(matrixStats)
+library(limma)
+library(ashr)
+```
+
+
+## 1. Build pairwise feature matrix once
+
+
+```{r}
+alpha <- 0.05
+
+theta <- fit_multinom$L
+stopifnot(nrow(theta) == nrow(df))
+
+N <- nrow(theta)
+K <- ncol(theta)
+
+c0 <- 1e-4
+eps_k <- c0 * colMedians(theta, na.rm = TRUE)
+eps_k <- pmin(pmax(eps_k, 1e-12), 1e-2)
+
+theta01   <- pmin(pmax(theta, 0), 1)
+log_theta <- log(sweep(theta01, 2, eps_k, FUN = "+"))
+
+df <- droplevels(meta_balanced) %>%
+  mutate(
+    treatment  = droplevels(factor(treatment)),
+    dosage     = droplevels(factor(dosage)),
+    time       = droplevels(factor(time)),
+    cell_state = droplevels(factor(cell_state, levels = c("G1","S","G2","M","APOP")))
+  )
+
+df$cond_cs <- interaction(df$treatment, df$dosage, df$time, df$cell_state,
+                          sep = "_", drop = TRUE)
+df$cond_cs <- relevel(df$cond_cs, ref = "WT_0_0_G1")
+
+design_cs <- model.matrix(~ cond_cs, data = df)
+colnames(design_cs) <- make.names(colnames(design_cs))
+stopifnot(limma::is.fullrank(design_cs))
+
+pair_mat <- t(combn(K, 2))
+n_pairs  <- nrow(pair_mat)
+
+log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+for (p in seq_len(n_pairs)) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat[, p] <- log_theta[, k1] - log_theta[, k2]
+}
+
+colnames(log_ratio_mat) <- apply(pair_mat, 1, function(idx) {
+  paste0("T", idx[1], "_vs_T", idx[2])
+})
+
+Y_lr <- t(log_ratio_mat)
+```
+
+
+
+## 2. Pair parsing helper
+
+```{r}
+parse_pairs <- function(pair_vec) {
+  parts <- do.call(rbind, strsplit(pair_vec, "_vs_"))
+  tibble(
+    pair = pair_vec,
+    k1 = as.integer(sub("^T", "", parts[,1])),
+    k2 = as.integer(sub("^T", "", parts[,2]))
+  )
+}
+
+pair_info <- parse_pairs(rownames(Y_lr))
+stopifnot(!any(is.na(pair_info$k1)), !any(is.na(pair_info$k2)))
+```
+
+
+## 3. Fit ordinary and moderated limma once
+
+
+```{r}
+fit_lm_only <- lmFit(Y_lr, design_cs)
+fit_mod     <- eBayes(fit_lm_only, robust = TRUE)
+
+cond_cs_coefs <- grep("^cond_cs", colnames(fit_lm_only$coefficients), value = TRUE)
+```
+
+
+## 4. Generic helpers to extract method-specific pair tables
+
+
+```{r}
+get_limma_table <- function(fit_obj, coef_name) {
+  tt <- topTable(fit_obj, coef = coef_name, number = Inf, sort.by = "none")
+  tt$coef <- coef_name
+  tt$pair <- rownames(tt)
+  rownames(tt) <- NULL
+  tt
+}
+
+get_nomod_table <- function(fit_lm_only, coef_name) {
+  j <- match(coef_name, colnames(fit_lm_only$coefficients))
+  stopifnot(!is.na(j))
+
+  coef_mat <- fit_lm_only$coefficients
+  se_mat   <- fit_lm_only$stdev.unscaled * fit_lm_only$sigma
+  t_stat   <- coef_mat[, j] / se_mat[, j]
+
+  df_res <- fit_lm_only$df.residual
+  if (length(df_res) == 1) {
+    pval <- 2 * pt(-abs(t_stat), df = df_res)
+  } else {
+    pval <- vapply(seq_len(nrow(coef_mat)),
+                   function(i) 2 * pt(-abs(t_stat[i]), df = df_res[i]),
+                   numeric(1))
+  }
+
+  out <- data.frame(
+    logFC = coef_mat[, j],
+    AveExpr = fit_lm_only$Amean,
+    t = t_stat,
+    P.Value = pval,
+    adj.P.Val = p.adjust(pval, method = "BH"),
+    coef = coef_name,
+    pair = rownames(coef_mat)
+  )
+  out
+}
+
+get_ash_table <- function(fit_lm_only, coef_name, use_df = TRUE) {
+  j <- match(coef_name, colnames(fit_lm_only$coefficients))
+  stopifnot(!is.na(j))
+
+  betahat <- fit_lm_only$coefficients[, j]
+  sehat   <- fit_lm_only$stdev.unscaled[, j] * fit_lm_only$sigma
+  df_all  <- fit_lm_only$df.residual
+  if (length(df_all) == 1) df_all <- rep(df_all, length(betahat))
+
+  ok <- is.finite(betahat) & is.finite(sehat) & sehat > 0 & is.finite(df_all)
+  df_scalar <- unique(fit_lm_only$df.residual)
+  stopifnot(length(df_scalar) == 1)
+
+  fit_ash <- if (use_df) {
+    ash(betahat = betahat[ok], sebetahat = sehat[ok], df = df_scalar)
+  } else {
+    ash(betahat = betahat[ok], sebetahat = sehat[ok])
+  }
+
+  out <- data.frame(
+    coef      = coef_name,
+    pair      = rownames(fit_lm_only$coefficients),
+    logFC     = betahat,
+    SE        = sehat,
+    AveExpr   = fit_lm_only$Amean,
+    post_mean = NA_real_,
+    lfsr      = NA_real_,
+    q_ash     = NA_real_
+  )
+
+  out$post_mean[ok] <- get_pm(fit_ash)
+  out$lfsr[ok]      <- get_lfsr(fit_ash)
+  qtmp <- tryCatch(get_qvalue(fit_ash), error = function(e) NULL)
+  if (!is.null(qtmp)) out$q_ash[ok] <- qtmp
+
+  out
+}
+```
+
+```{r}
+run_epb_one_coef <- function(fit_lm_only, coef_name, alpha = 0.05) {
+  j <- match(coef_name, colnames(fit_lm_only$coefficients))
+  stopifnot(!is.na(j))
+
+  beta_vec <- as.numeric(fit_lm_only$coefficients[, j])
+  se_vec   <- as.numeric(fit_lm_only$stdev.unscaled[, j] * fit_lm_only$sigma)
+  se2_vec  <- se_vec^2
+
+  df_all <- fit_lm_only$df.residual
+  df_scalar <- unique(df_all)
+  stopifnot(length(df_scalar) == 1)
+  nu_val <- as.integer(df_scalar)
+
+  julia_assign("beta_vec_r", beta_vec)
+  julia_assign("se2_vec_r", se2_vec)
+  julia_assign("nu_val_r", nu_val)
+  julia_assign("alpha_r", alpha)
+
+  julia_command("samples_epb = [Empirikos.NormalChiSquareSample(beta_vec_r[i], se2_vec_r[i], nu_val_r) for i in eachindex(beta_vec_r)]")
+  julia_command("test_epb_r = Empirikos.EmpiricalPartiallyBayesTTest(α = alpha_r, solver = Hypatia.Optimizer)")
+  julia_command("res_epb_r = fit(test_epb_r, samples_epb)")
+
+  data.frame(
+    coef = coef_name,
+    pair = rownames(fit_lm_only$coefficients),
+    logFC = beta_vec,
+    SE = se_vec,
+    AveExpr = fit_lm_only$Amean,
+    P.Value = as.numeric(julia_eval("res_epb_r.pvalue")),
+    adj.P.Val = as.numeric(julia_eval("res_epb_r.adjp"))
+  )
+}
+
+```
+
+## 5. Build all three pair-level result tables
+
+```{r}
+res_pairs_mod <- bind_rows(lapply(cond_cs_coefs, function(cf) get_limma_table(fit_mod, cf)))
+res_pairs_nomod <- bind_rows(lapply(cond_cs_coefs, function(cf) get_nomod_table(fit_lm_only, cf)))
+res_pairs_ash <- bind_rows(lapply(cond_cs_coefs, function(cf) get_ash_table(fit_lm_only, cf, use_df = TRUE)))
+res_pairs_epb <- bind_rows(lapply(cond_cs_coefs, function(cf) {
+  message("Running EPB for ", cf)
+  run_epb_one_coef(fit_lm_only, cf, alpha = alpha)
+}))
+```
+
+
+## 6. Directed expansion helper
+
+```{r}
+make_res_directed <- function(res_pairs, pair_info, beta_col = "logFC", q_col = "adj.P.Val") {
+  res_long <- res_pairs %>%
+    left_join(pair_info, by = "pair")
+
+  bind_rows(
+    res_long %>% transmute(
+      coef, pair, topic = k1, other = k2,
+      beta = .data[[beta_col]],
+      q = .data[[q_col]]
+    ),
+    res_long %>% transmute(
+      coef, pair, topic = k2, other = k1,
+      beta = -.data[[beta_col]],
+      q = .data[[q_col]]
+    )
+  )
+}
+
+res_directed_mod   <- make_res_directed(res_pairs_mod, pair_info, beta_col = "logFC", q_col = "adj.P.Val")
+res_directed_nomod <- make_res_directed(res_pairs_nomod, pair_info, beta_col = "logFC", q_col = "adj.P.Val")
+
+res_directed_ash <- res_pairs_ash %>%
+  left_join(pair_info, by = "pair") %>%
+  {
+    bind_rows(
+      transmute(., coef, pair, topic = k1, other = k2,
+                beta = logFC, beta_post = post_mean, lfsr = lfsr, q_ash = q_ash),
+      transmute(., coef, pair, topic = k2, other = k1,
+                beta = -logFC, beta_post = -post_mean, lfsr = lfsr, q_ash = q_ash)
+    )
+  }
+res_directed_epb <- make_res_directed(
+  res_pairs_epb, pair_info,
+  beta_col = "logFC", q_col = "adj.P.Val"
+)
+```
+
+
+## 7. Topic summary helper
+
+```{r}
+make_topic_summary <- function(res_directed, q_var = "q", beta_var = "beta", alpha = 0.05) {
+  res_directed %>%
+    group_by(coef, topic) %>%
+    summarise(
+      n_total  = sum(!is.na(.data[[q_var]])),
+      n_sig    = sum(.data[[q_var]] < alpha, na.rm = TRUE),
+      frac_sig = n_sig / n_total,
+      S        = min(abs(.data[[beta_var]]), na.rm = TRUE),
+      Q_worst  = max(.data[[q_var]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(topic = paste0("T", topic))
+}
+
+topic_summary_mod   <- make_topic_summary(res_directed_mod, q_var = "q", beta_var = "beta", alpha = alpha)
+topic_summary_nomod <- make_topic_summary(res_directed_nomod, q_var = "q", beta_var = "beta", alpha = alpha)
+topic_summary_ash_q <- make_topic_summary(
+  res_directed_ash %>%
+    transmute(
+      coef, pair, topic, other,
+      beta = beta_post,
+      q = q_ash
+    ),
+  q_var = "q", beta_var = "beta", alpha = alpha
+)
+# topic_summary_ash_q <- make_topic_summary(
+#   res_directed_ash %>% rename(q = q_ash, beta = beta_post),
+#   q_var = "q", beta_var = "beta", alpha = alpha
+# )
+topic_summary_epb <- make_topic_summary(
+  res_directed_epb,
+  q_var = "q", beta_var = "beta", alpha = alpha
+)
+```
+
+
+## 8. Moderated vs non-moderated comparisons
+
+```{r}
+cmp_pairs <- res_pairs_mod %>%
+  select(coef, pair, P_mod = P.Value, q_mod = adj.P.Val) %>%
+  inner_join(
+    res_pairs_nomod %>% select(coef, pair, P_nomod = P.Value, q_nomod = adj.P.Val),
+    by = c("coef", "pair")
+  ) %>%
+  mutate(
+    P_mod_c   = pmax(P_mod, 1e-300),
+    P_nomod_c = pmax(P_nomod, 1e-300),
+    q_mod_c   = pmax(q_mod, 1e-300),
+    q_nomod_c = pmax(q_nomod, 1e-300),
+    log10p_mod   = -log10(P_mod_c),
+    log10p_nomod = -log10(P_nomod_c),
+    d_log10p     = log10p_mod - log10p_nomod,
+    log10q_mod   = -log10(q_mod_c),
+    log10q_nomod = -log10(q_nomod_c),
+    d_log10q     = log10q_mod - log10q_nomod
+  )
+
+ggplot(cmp_pairs, aes(x = log10p_nomod, y = log10p_mod)) +
+  geom_point(alpha = 0.35, size = 0.7) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_bw() +
+  labs(
+    x = expression(-log[10](p[no~mod])),
+    y = expression(-log[10](p[mod])),
+    title = "Moderated vs non-moderated p-values across all pairs/conditions"
+  )
+
+ggplot(cmp_pairs, aes(x = coef, y = d_log10p)) +
+  geom_boxplot(outlier.size = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    x = "Condition coefficient",
+    y = expression(Delta * -log[10](p)),
+    title = "Effect of eBayes moderation on p-values by condition"
+  )
+```
+
+
+
+## 9. Variance moderation plots
+
+```{r}
+var_df <- data.frame(
+  pair = rownames(fit_lm_only$coefficients),
+  s2_raw  = fit_lm_only$sigma^2,
+  s2_post = fit_mod$s2.post
+) %>%
+  mutate(
+    s2_raw_c = pmax(s2_raw, 1e-300),
+    s2_post_c = pmax(s2_post, 1e-300),
+    log10_s2_raw = log10(s2_raw_c),
+    log10_s2_post = log10(s2_post_c),
+    log10_var_ratio = log10(s2_post_c / s2_raw_c)
+  )
+
+ggplot(var_df, aes(x = log10_s2_raw, y = log10_s2_post)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_bw() +
+  labs(
+    x = expression(log[10](s[raw]^2)),
+    y = expression(log[10](s[post]^2)),
+    title = "Raw residual variance vs limma moderated posterior variance"
+  )
+
+ggplot(var_df, aes(x = log10_s2_raw, y = log10_var_ratio)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_bw() +
+  labs(
+    x = expression(log[10](s[raw]^2)),
+    y = expression(log[10](s[post]^2 / s[raw]^2)),
+    title = "Amount of variance moderation vs raw residual variance"
+  )
+```
+
+
+## 10. Four-method topic-level comparison
+
+```{r}
+topic_frac_4 <- bind_rows(
+  topic_summary_nomod %>% transmute(coef, topic, method = "limma_noModeration", frac_sig = frac_sig),
+  topic_summary_mod   %>% transmute(coef, topic, method = "limma_eBayes", frac_sig = frac_sig),
+  topic_summary_ash_q %>% transmute(coef, topic, method = "ash_qvalue", frac_sig = frac_sig),
+  topic_summary_epb   %>% transmute(coef, topic, method = "epb_np", frac_sig = frac_sig)
+) %>%
+  mutate(method = factor(
+    method,
+    levels = c("limma_noModeration", "limma_eBayes", "ash_qvalue", "epb_np")
+  ))
+
+ggplot(topic_frac_4, aes(x = method, y = frac_sig)) +
+  geom_boxplot(outlier.size = 0.4) +
+  theme_bw() +
+  labs(
+    x = "Method",
+    y = "Fraction significant (per condition × topic)",
+    title = "Comparison of topic-level fraction significant across four methods"
+  )
+
+cond_frac_4 <- topic_frac_4 %>%
+  group_by(coef, method) %>%
+  summarise(
+    mean_frac_sig = mean(frac_sig, na.rm = TRUE),
+    med_frac_sig  = median(frac_sig, na.rm = TRUE),
+    prop_topics_ge50 = mean(frac_sig >= 0.5, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(cond_frac_4, aes(x = method, y = mean_frac_sig)) +
+  geom_boxplot(outlier.size = 0.4) +
+  theme_bw() +
+  labs(
+    x = "Method",
+    y = "Mean frac_sig across topics (per condition)",
+    title = "Per-condition mean topic fraction significant across four methods"
+  )
+```
+
+
+## 11. Pair-level q-value comparison and significance-state heatmap
+
+```{r}
+q_cmp_pairs <- res_pairs_mod %>%
+  select(coef, pair, q_mod = adj.P.Val) %>%
+  inner_join(
+    res_pairs_nomod %>% select(coef, pair, q_nomod = adj.P.Val),
+    by = c("coef", "pair")
+  ) %>%
+  inner_join(
+    res_pairs_ash %>% select(coef, pair, q_ash),
+    by = c("coef", "pair")
+  ) %>%
+  inner_join(
+    res_pairs_epb %>% select(coef, pair, q_epb = adj.P.Val),
+    by = c("coef", "pair")
+  ) %>%
+  mutate(
+    sig_nomod = q_nomod < alpha,
+    sig_mod   = q_mod   < alpha,
+    sig_ash   = q_ash   < alpha,
+    sig_epb   = q_epb   < alpha,
+    sig_state = paste0(
+      ifelse(sig_nomod, "N", "-"),
+      ifelse(sig_mod,   "L", "-"),
+      ifelse(sig_ash,   "A", "-"),
+      ifelse(sig_epb,   "E", "-")
+    )
+  )
+
+state_levels4 <- c(
+  "----",
+  "N---", "-L--", "--A-", "---E",
+  "NL--", "N-A-", "N--E", "-LA-", "-L-E", "--AE",
+  "NLA-", "NL-E", "N-AE", "-LAE",
+  "NLAE"
+)
+
+state_df4 <- q_cmp_pairs %>%
+  group_by(coef, sig_state) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(coef) %>%
+  mutate(frac = n / sum(n)) %>%
+  ungroup()
+
+state_df4$sig_state <- factor(state_df4$sig_state, levels = state_levels4)
+state_df4$frac_fill <- ifelse(state_df4$frac == 0, NA, state_df4$frac)
+
+ggplot(state_df4, aes(x = sig_state, y = coef, fill = frac_fill)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low = "#d9ecff",
+    high = "steelblue",
+    na.value = "grey90",
+    name = "Fraction of pairs"
+  ) +
+  theme_bw() +
+  labs(
+    x = "Significance state (N=no-mod, L=limma, A=ASH, E=EPB)",
+    y = "Coefficient",
+    title = "Agreement of pairwise significance calls across four methods"
+  )
+```
+
+## 12. Method-difference plots
+
+```{r}
+topic_frac_wide <- topic_frac_3 %>%
+  select(coef, topic, method, frac_sig) %>%
+  pivot_wider(names_from = method, values_from = frac_sig) %>%
+  mutate(
+    d_ebayes_vs_nomod = limma_eBayes - limma_noModeration,
+    d_ash_vs_ebayes   = ash_qvalue - limma_eBayes,
+    d_ash_vs_nomod    = ash_qvalue - limma_noModeration
+  )
+
+diff_long <- topic_frac_wide %>%
+  select(coef, topic, d_ebayes_vs_nomod, d_ash_vs_ebayes, d_ash_vs_nomod) %>%
+  pivot_longer(cols = starts_with("d_"), names_to = "comparison", values_to = "d_frac_sig")
+
+ggplot(diff_long, aes(x = comparison, y = d_frac_sig)) +
+  geom_boxplot(outlier.size = 0.4) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_bw() +
+  labs(
+    x = "Comparison",
+    y = "Difference in frac_sig",
+    title = "Pairwise method differences in topic-level fraction significant"
+  )
+
+ggplot(diff_long, aes(x = d_frac_sig)) +
+  geom_histogram(bins = 40) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ comparison, scales = "free_y") +
+  theme_bw() +
+  labs(
+    x = "Difference in frac_sig",
+    y = "Count",
+    title = "Distribution of pairwise method differences in topic-level frac_sig"
+  )
+```
