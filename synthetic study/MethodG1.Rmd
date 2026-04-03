@@ -1,0 +1,342 @@
+---
+title: "Method G"
+output: pdf_document
+date: "2025-10-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(MCMCpack)
+library(compositions)
+library(limma)
+
+## -----------------------------
+## 1. Simulator
+## -----------------------------
+simulate_topics_dirichlet <- function(
+  N = 1000,
+  G = 500,
+  K = 5,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 123
+) {
+  set.seed(seed)
+
+  X <- rbinom(N, 1, 0.5)
+
+  mu_k   <- rnorm(K, 0, 1)
+  diff_k <- sample(c(TRUE, FALSE), K, replace = TRUE,
+                   prob = c(frac_diff, 1 - frac_diff))
+  beta_k <- ifelse(diff_k, rnorm(K, mean = beta_strength, sd = 2), 0)
+
+  eta <- sapply(seq_len(K), function(k) {
+    rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  })
+
+  softmax <- function(v) exp(v) / sum(exp(v))
+  Z <- t(apply(eta, 1, softmax))
+  stopifnot(all(abs(rowSums(Z) - 1) < 1e-8))
+
+  T_mat <- matrix(rlnorm(K * G, meanlog = 0, sdlog = 1), K, G)
+  W <- t(apply(T_mat, 1, function(a) MCMCpack::rdirichlet(1, a)))
+  rownames(W) <- paste0("Topic", seq_len(K))
+
+  l_n <- runif(N, 1000, 10000)
+  alpha_g <- rexp(G, rate = 0.2)
+
+  mean_ng <- (Z %*% W) * l_n
+
+  X_ng <- matrix(NA_real_, nrow = N, ncol = G)
+  for (g in seq_len(G)) {
+    shape <- alpha_g[g]
+    rate  <- alpha_g[g] / mean_ng[, g]
+    X_ng[, g] <- rgamma(N, shape = shape, rate = rate)
+  }
+
+  Y_ng <- matrix(rpois(N * G, lambda = as.vector(X_ng)), N, G)
+
+  list(
+    Y = Y_ng,
+    Z = Z,
+    W = W,
+    beta_true = beta_k,
+    diff_topics = diff_k,
+    diff_topic_ids = which(diff_k),
+    X = X,
+    mu = mu_k,
+    alpha_g = alpha_g,
+    library_size = l_n
+  )
+}
+
+## -----------------------------
+## 2. Metrics
+## -----------------------------
+compute_metrics <- function(disc, true_topics) {
+  power <- if (any(true_topics)) mean(disc[true_topics]) else NA_real_
+  n_disc <- sum(disc)
+  emp_fdr <- if (n_disc == 0) 0 else sum(disc & !true_topics) / n_disc
+  list(power = power, emp_fdr = emp_fdr)
+}
+
+## -----------------------------
+## 3. Pseudo-count computation
+## -----------------------------
+compute_mnk <- function(Z, Y, W, eps = 1e-8) {
+  N <- nrow(Z)
+  K <- ncol(Z)
+  mnk <- matrix(0, N, K)
+
+  for (n in seq_len(N)) {
+    denom <- drop(Z[n, , drop = FALSE] %*% W) + eps
+    for (k in seq_len(K)) {
+      w <- Z[n, k] * W[k, ] / denom
+      mnk[n, k] <- sum(Y[n, ] * w)
+    }
+  }
+
+  colnames(mnk) <- paste0("Topic", seq_len(K))
+  mnk
+}
+
+## -----------------------------
+## 4. One-run quasi-Poisson method
+## -----------------------------
+run_one_sim_poisson <- function(
+  N = 1000,
+  G = 300,
+  K = 6,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 1
+) {
+  sim <- simulate_topics_dirichlet(
+    N = N,
+    G = G,
+    K = K,
+    frac_diff = frac_diff,
+    beta_strength = beta_strength,
+    seed = seed
+  )
+
+  Z <- as.matrix(sim$Z)
+  Y <- as.matrix(sim$Y)
+  W <- as.matrix(sim$W)
+  X_cond <- sim$X
+  true_topics <- sim$diff_topics
+  size_factor <- as.numeric(sim$library_size)
+
+  mnk <- compute_mnk(Z, Y, W)
+
+  pvals <- numeric(K)
+  for (k in seq_len(K)) {
+    fit <- suppressWarnings(
+      glm(mnk[, k] ~ X_cond + offset(log(size_factor)),
+          family = quasipoisson())
+    )
+    pvals[k] <- summary(fit)$coefficients["X_cond", "Pr(>|t|)"]
+  }
+
+  adj_pvals <- p.adjust(pvals, method = "fdr")
+  disc <- adj_pvals < 0.05
+
+  list(
+    disc = disc,
+    true_topics = true_topics,
+    pvals = pvals,
+    adj_pvals = adj_pvals,
+    mnk = mnk,
+    sim = sim
+  )
+}
+
+## -----------------------------
+## 5. Bootstrap stability
+## -----------------------------
+.jaccard <- function(a, b) {
+  u <- sum(a | b)
+  if (u == 0) return(NA_real_)
+  sum(a & b) / u
+}
+
+.poisson_calls_once <- function(Z_sub, Y_sub, X_sub, W, size_factor,
+                                fdr_thresh = 0.05) {
+  mnk <- compute_mnk(Z_sub, Y_sub, W)
+
+  K <- ncol(mnk)
+  pvals <- numeric(K)
+  for (k in seq_len(K)) {
+    fit <- suppressWarnings(
+      glm(mnk[, k] ~ X_sub + offset(log(size_factor)),
+          family = quasipoisson())
+    )
+    pvals[k] <- summary(fit)$coefficients[2, 4]
+  }
+
+  adjp <- p.adjust(pvals, method = "fdr")
+  disc <- adjp < fdr_thresh
+  names(disc) <- colnames(mnk)
+  disc
+}
+
+stability_for_dataset_poisson <- function(sim, B = 50, fdr_thresh = 0.05, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+
+  Z <- as.matrix(sim$Z)
+  Y <- as.matrix(sim$Y)
+  X <- sim$X
+  W <- as.matrix(sim$W)
+  lib_size <- as.numeric(sim$library_size)
+
+  K <- ncol(Z)
+  disc_mat <- matrix(FALSE, nrow = B, ncol = K)
+  colnames(disc_mat) <- paste0("Topic", seq_len(K))
+
+  for (b in seq_len(B)) {
+    idx <- sample(seq_len(nrow(Z)), replace = TRUE)
+    disc_mat[b, ] <- .poisson_calls_once(
+      Z_sub = Z[idx, , drop = FALSE],
+      Y_sub = Y[idx, , drop = FALSE],
+      X_sub = X[idx],
+      W = W,
+      size_factor = lib_size[idx],
+      fdr_thresh = fdr_thresh
+    )
+  }
+
+  topic_freq <- colMeans(disc_mat)
+
+  if (B >= 2) {
+    pair_ids <- combn(B, 2)
+    jacc_vals <- apply(pair_ids, 2, function(ix) {
+      .jaccard(disc_mat[ix[1], ], disc_mat[ix[2], ])
+    })
+    mean_jacc <- mean(jacc_vals, na.rm = TRUE)
+  } else {
+    mean_jacc <- NA_real_
+  }
+
+  list(
+    topic_freq = topic_freq,
+    mean_jacc = mean_jacc,
+    disc_mat = disc_mat
+  )
+}
+
+## -----------------------------
+## 6. Signal scenario
+## -----------------------------
+set.seed(999)
+
+R <- 100
+power_vec    <- numeric(R)
+fdr_vec      <- numeric(R)
+stab_jaccvec <- numeric(R)
+stab_avgfreq <- numeric(R)
+
+for (r in seq_len(R)) {
+  out <- run_one_sim_poisson(
+    N = 2000,
+    G = 300,
+    K = 6,
+    frac_diff = 0.4,
+    beta_strength = 2,
+    seed = r
+  )
+
+  m <- compute_metrics(out$disc, out$true_topics)
+  power_vec[r] <- m$power
+  fdr_vec[r]   <- m$emp_fdr
+
+  stab <- stability_for_dataset_poisson(out$sim, B = 50, fdr_thresh = 0.05)
+  stab_jaccvec[r] <- stab$mean_jacc
+  stab_avgfreq[r] <- mean(stab$topic_freq)
+}
+
+cat("=== Quasipoisson : SIGNAL scenario ===\n")
+cat("Mean power across sims          =", round(mean(power_vec, na.rm = TRUE), 3), "\n")
+cat("Mean empirical FDR across sims  =", round(mean(fdr_vec), 3), "\n")
+cat("Mean Jaccard stability          =", round(mean(stab_jaccvec, na.rm = TRUE), 3), "\n")
+cat("Mean topic discovery frequency  =", round(mean(stab_avgfreq, na.rm = TRUE), 3), "\n")
+
+## -----------------------------
+## 7. Single-run stability example
+## -----------------------------
+set.seed(123)
+
+out <- run_one_sim_poisson(
+  N = 2000,
+  G = 300,
+  K = 6,
+  frac_diff = 0.4,
+  beta_strength = 2,
+  seed = 123
+)
+
+m <- compute_metrics(out$disc, out$true_topics)
+stab <- stability_for_dataset_poisson(out$sim, B = 50, fdr_thresh = 0.05)
+
+cat("\n=== Quasipoisson : single run ===\n")
+cat("Power =", round(m$power, 3), "\n")
+cat("Empirical FDR =", round(m$emp_fdr, 3), "\n")
+cat("Mean Jaccard stability =", round(stab$mean_jacc, 3), "\n")
+
+topic_summary <- data.frame(
+  Topic = paste0("Topic", seq_along(stab$topic_freq)),
+  TrueDiff = out$true_topics,
+  DiscoveryFreq = round(stab$topic_freq, 3)
+)
+print(topic_summary, row.names = FALSE)
+
+## -----------------------------
+## 8. Null scenario
+## -----------------------------
+set.seed(999)
+
+null_fdr <- numeric(R)
+pvals_by_topic <- matrix(NA_real_, nrow = R, ncol = 6)
+adjp_by_topic  <- matrix(NA_real_, nrow = R, ncol = 6)
+
+for (r in seq_len(R)) {
+  out <- run_one_sim_poisson(
+    N = 2000,
+    G = 300,
+    K = 6,
+    frac_diff = 0.0,
+    beta_strength = 2,
+    seed = r
+  )
+
+  m <- compute_metrics(out$disc, out$true_topics)
+  null_fdr[r] <- m$emp_fdr
+  pvals_by_topic[r, ] <- out$pvals
+  adjp_by_topic[r, ]  <- out$adj_pvals
+}
+
+cat("=== Quasipoisson : NULL scenario ===\n")
+cat("Mean empirical FDR across sims =", round(mean(null_fdr), 3), "\n")
+
+par(mfrow = c(2, 3))
+for (k in 1:6) {
+  hist(pvals_by_topic[, k],
+       breaks = 20, col = "skyblue", border = "white",
+       main = paste("Topic", k), xlab = "Raw p-value", ylab = "Frequency")
+  abline(h = R / 20, col = "red", lty = 2)
+}
+par(mfrow = c(1, 1))
+
+par(mfrow = c(2, 3))
+for (k in 1:6) {
+  hist(adjp_by_topic[, k],
+       breaks = 20, col = "skyblue", border = "white",
+       main = paste("Topic", k), xlab = "Adjusted p-value", ylab = "Frequency")
+  abline(h = R / 20, col = "red", lty = 2)
+}
+par(mfrow = c(1, 1))
+```
+
