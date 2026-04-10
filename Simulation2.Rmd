@@ -1,0 +1,660 @@
+---
+title: "Simulation2"
+output: pdf_document
+date: "2026-04-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Option B
+## one simulation
+```{r}
+library(MCMCpack)
+library(fastTopics)
+library(limma)
+library(clue)
+library(ggplot2)
+library(reshape2)
+
+set.seed(1)
+
+# ============================================================
+# 1. Settings
+# ============================================================
+N <- 1000
+G <- 500
+K <- 6
+n_diff <- 2
+beta_strength <- 2
+eps <- 1e-8
+
+# ============================================================
+# 2. Condition
+# ============================================================
+X <- rbinom(N, 1, 0.5)
+cat("Number in control:", sum(X == 0), "\n")
+cat("Number in treatment:", sum(X == 1), "\n")
+
+# ============================================================
+# 3. True topic-level parameters
+# ============================================================
+mu_k <- rnorm(K, 0, 0.5)
+
+diff_k <- rep(FALSE, K)
+diff_idx <- sample(1:K, n_diff, replace = FALSE)
+diff_k[diff_idx] <- TRUE
+
+# use same effect for all true topics to match current truth setup
+beta_k <- ifelse(diff_k, beta_strength, 0)
+
+truth_topic <- data.frame(
+  topic = paste0("Topic", 1:K),
+  mu_k = round(mu_k, 3),
+  beta_k = round(beta_k, 3),
+  diff_k = diff_k
+)
+
+cat("\n=== True topic-level truth ===\n")
+print(truth_topic, row.names = FALSE)
+
+# ============================================================
+# 4. Generate latent logits and intensities
+# ============================================================
+eta <- matrix(NA_real_, nrow = N, ncol = K)
+for (k in 1:K) {
+  eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+}
+colnames(eta) <- paste0("Topic", 1:K)
+
+# Option 2 uses intensities, not softmax proportions
+E_true <- exp(eta)
+colnames(E_true) <- paste0("Topic", 1:K)
+
+# also keep compositional truth for reference only
+softmax <- function(v) exp(v) / sum(exp(v))
+Z_true <- t(apply(eta, 1, softmax))
+colnames(Z_true) <- paste0("Topic", 1:K)
+
+cat("\nCheck rows of Z_true sum to 1:\n")
+print(summary(rowSums(Z_true)))
+
+# ============================================================
+# 5. True topic-gene matrix and counts
+# ============================================================
+T_mat <- matrix(rlnorm(K * G, meanlog = 0, sdlog = 1), K, G)
+W_true <- matrix(NA_real_, nrow = K, ncol = G)
+for (k in 1:K) {
+  W_true[k, ] <- rdirichlet(1, alpha = T_mat[k, ])
+}
+rownames(W_true) <- paste0("Topic", 1:K)
+
+library_size <- runif(N, 1000, 10000)
+
+mean_ng <- (E_true %*% W_true) * library_size
+Y_ng <- matrix(rpois(N * G, lambda = as.vector(mean_ng)), N, G)
+
+cat("\nCounts matrix dimension:\n")
+print(dim(Y_ng))
+cat("Row sums of counts (should track library size):\n")
+print(summary(rowSums(Y_ng)))
+
+# ============================================================
+# 6. Fit fastTopics
+# ============================================================
+fit <- fit_poisson_nmf(Y_ng, k = K, numiter = 200, verbose = "none")
+fit_multinom <- poisson2multinom(fit)
+
+theta_hat <- fit_multinom$L   # N x K estimated topic proportions
+beta_hat  <- fit_multinom$F   # G x K estimated topic-gene weights
+
+# ============================================================
+# 7. Align estimated topics to truth
+# ============================================================
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1 * v2) / (sqrt(sum(v1^2) * sum(v2^2)) + 1e-20)
+      D[k, j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(
+    per_topic = diffs,
+    mean_error = mean(diffs),
+    max_error = max(diffs)
+  )
+}
+
+D <- compute_distance_matrix(W_true, t(beta_hat))
+assignment <- solve_LSAP(D)
+
+theta_hat_aligned <- theta_hat[, assignment, drop = FALSE]
+beta_hat_aligned  <- beta_hat[, assignment, drop = FALSE]
+W_est_aligned     <- t(beta_hat_aligned)
+
+colnames(theta_hat_aligned) <- paste0("Topic", 1:K)
+rownames(W_est_aligned) <- paste0("Topic", 1:K)
+
+err <- compute_topic_error(W_true, W_est_aligned)
+
+cat("\n=== Topic alignment ===\n")
+print(data.frame(
+  true_topic = paste0("Topic", 1:K),
+  matched_estimated_topic = paste0("EstTopic", as.integer(assignment)),
+  topic_error = round(err$per_topic, 4)
+), row.names = FALSE)
+
+cat("\nMean topic estimation error:", round(err$mean_error, 4), "\n")
+cat("Max topic estimation error:", round(err$max_error, 4), "\n")
+
+# ============================================================
+# 8. Compare true vs estimated topic summaries
+# ============================================================
+mean_Ztrue_0 <- colMeans(Z_true[X == 0, , drop = FALSE])
+mean_Ztrue_1 <- colMeans(Z_true[X == 1, , drop = FALSE])
+
+mean_That_0 <- colMeans(theta_hat_aligned[X == 0, , drop = FALSE])
+mean_That_1 <- colMeans(theta_hat_aligned[X == 1, , drop = FALSE])
+
+topic_compare <- data.frame(
+  topic = paste0("Topic", 1:K),
+  diff_k = diff_k,
+  beta_k = beta_k,
+  true_mean_control = round(mean_Ztrue_0, 4),
+  true_mean_treat   = round(mean_Ztrue_1, 4),
+  true_diff         = round(mean_Ztrue_1 - mean_Ztrue_0, 4),
+  est_mean_control  = round(mean_That_0, 4),
+  est_mean_treat    = round(mean_That_1, 4),
+  est_diff          = round(mean_That_1 - mean_That_0, 4)
+)
+
+cat("\n=== True vs estimated topic summaries ===\n")
+print(topic_compare, row.names = FALSE)
+
+# ============================================================
+# 9. Plot estimated topic proportions by condition
+# ============================================================
+df_est_topic <- data.frame(
+  sample = 1:N,
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  theta_hat_aligned
+)
+
+df_est_topic_long <- melt(
+  df_est_topic,
+  id.vars = c("sample", "condition"),
+  variable.name = "topic",
+  value.name = "theta_est"
+)
+
+ggplot(df_est_topic_long, aes(x = condition, y = theta_est, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Estimated topic proportions by condition (aligned)",
+    y = expression(hat(theta))
+  )
+
+# ============================================================
+# 10. Pairwise truth and observed shifts
+# ============================================================
+pair_mat <- t(combn(K, 2))
+
+pair_df <- data.frame(
+  pair = apply(pair_mat, 1, function(idx) paste0("T", idx[1], "_vs_T", idx[2])),
+  k1 = pair_mat[, 1],
+  k2 = pair_mat[, 2]
+)
+
+# current truth setup: one true and one false = non-null
+pair_df$diff_k1 <- diff_k[pair_df$k1]
+pair_df$diff_k2 <- diff_k[pair_df$k2]
+pair_df$pair_true <- pair_df$diff_k1 != pair_df$diff_k2
+
+pair_df$beta_k1 <- beta_k[pair_df$k1]
+pair_df$beta_k2 <- beta_k[pair_df$k2]
+pair_df$beta_diff <- pair_df$beta_k1 - pair_df$beta_k2
+
+# observed shift from true compositional proportions (reference only)
+pair_df$obs_shift_true <- sapply(seq_len(nrow(pair_df)), function(i) {
+  k1 <- pair_df$k1[i]
+  k2 <- pair_df$k2[i]
+  lr <- log(Z_true[, k1] + eps) - log(Z_true[, k2] + eps)
+  mean(lr[X == 1]) - mean(lr[X == 0])
+})
+
+# observed shift from estimated aligned topic proportions
+pair_df$obs_shift_est <- sapply(seq_len(nrow(pair_df)), function(i) {
+  k1 <- pair_df$k1[i]
+  k2 <- pair_df$k2[i]
+  lr <- log(theta_hat_aligned[, k1] + eps) - log(theta_hat_aligned[, k2] + eps)
+  mean(lr[X == 1]) - mean(lr[X == 0])
+})
+
+pair_df$obs_shift_true <- round(pair_df$obs_shift_true, 3)
+pair_df$obs_shift_est  <- round(pair_df$obs_shift_est, 3)
+
+cat("\n=== Pairwise truth table ===\n")
+print(
+  pair_df[, c("pair", "diff_k1", "diff_k2", "pair_true",
+              "beta_diff", "obs_shift_true", "obs_shift_est")],
+  row.names = FALSE
+)
+
+# ============================================================
+# 11. Plot true vs estimated pairwise shifts
+# ============================================================
+ggplot(pair_df, aes(x = obs_shift_true, y = obs_shift_est, color = pair_true, label = pair)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.08, size = 3) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  theme_bw() +
+  labs(
+    title = "True vs estimated pairwise log-ratio shifts",
+    x = "Observed shift from true topic proportions",
+    y = "Observed shift from estimated aligned topic proportions"
+  )
+
+# ============================================================
+# 12. One-run ordinary + limma on estimated pairwise log-ratios
+# ============================================================
+n_pairs <- nrow(pair_mat)
+
+log_ratio_mat_est <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+colnames(log_ratio_mat_est) <- pair_df$pair
+
+for (p in 1:n_pairs) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat_est[, p] <- log(theta_hat_aligned[, k1] + eps) -
+                            log(theta_hat_aligned[, k2] + eps)
+}
+
+design <- model.matrix(~ X)
+fit0 <- lmFit(t(log_ratio_mat_est), design)
+
+coef_hat <- fit0$coefficients[, 2]
+se_hat   <- fit0$stdev.unscaled[, 2] * fit0$sigma
+
+# ordinary
+t_ord <- coef_hat / se_hat
+p_ord <- 2 * pt(-abs(t_ord), df = fit0$df.residual)
+q_ord <- p.adjust(p_ord, method = "BH")
+disc_ord <- q_ord < 0.05
+
+# limma
+fit_eb <- eBayes(fit0)
+q_limma <- p.adjust(fit_eb$p.value[, 2], method = "BH")
+disc_limma <- q_limma < 0.05
+
+one_run_res <- data.frame(
+  pair = pair_df$pair,
+  pair_true = pair_df$pair_true,
+  beta_diff = pair_df$beta_diff,
+  obs_shift_true = pair_df$obs_shift_true,
+  obs_shift_est  = pair_df$obs_shift_est,
+  coef_hat = round(coef_hat, 3),
+  se_hat = round(se_hat, 3),
+  q_ord = signif(q_ord, 3),
+  disc_ord = disc_ord,
+  q_limma = signif(q_limma, 3),
+  disc_limma = disc_limma
+)
+
+cat("\n=== One-run testing results on estimated topic proportions ===\n")
+print(one_run_res, row.names = FALSE)
+
+# ============================================================
+# 13. One pair in detail
+# ============================================================
+k1 <- pair_mat[1, 1]
+k2 <- pair_mat[1, 2]
+pair_name <- paste0("T", k1, "_vs_T", k2)
+
+lr_true <- log(Z_true[, k1] + eps) - log(Z_true[, k2] + eps)
+lr_est  <- log(theta_hat_aligned[, k1] + eps) - log(theta_hat_aligned[, k2] + eps)
+
+df_pair_detail <- data.frame(
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  log_ratio_true = lr_true,
+  log_ratio_est  = lr_est
+)
+
+cat("\n=== Detailed check for", pair_name, "===\n")
+cat("diff_k1 =", diff_k[k1], "\n")
+cat("diff_k2 =", diff_k[k2], "\n")
+cat("pair_true =", diff_k[k1] != diff_k[k2], "\n")
+cat("beta_1 =", beta_k[k1], "\n")
+cat("beta_2 =", beta_k[k2], "\n")
+cat("mean TRUE log-ratio in control =", round(mean(lr_true[X == 0]), 3), "\n")
+cat("mean TRUE log-ratio in treatment =", round(mean(lr_true[X == 1]), 3), "\n")
+cat("mean EST log-ratio in control =", round(mean(lr_est[X == 0]), 3), "\n")
+cat("mean EST log-ratio in treatment =", round(mean(lr_est[X == 1]), 3), "\n")
+
+df_pair_detail_long <- melt(
+  df_pair_detail,
+  id.vars = "condition",
+  variable.name = "source",
+  value.name = "log_ratio"
+)
+
+ggplot(df_pair_detail_long, aes(x = condition, y = log_ratio, fill = condition)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ source, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = paste0(pair_name, ": true vs estimated log-ratio by condition"),
+    y = "Log-ratio"
+  )
+```
+
+```{r}
+pseudo_true <- E_true * library_size
+colnames(pseudo_true) <- paste0("Topic", 1:K)
+
+df_pseudo_true <- data.frame(
+  sample = 1:N,
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  pseudo_true
+)
+
+df_pseudo_true_long <- reshape2::melt(
+  df_pseudo_true,
+  id.vars = c("sample", "condition"),
+  variable.name = "topic",
+  value.name = "pseudo_count_true"
+)
+
+ggplot(df_pseudo_true_long, aes(x = condition, y = pseudo_count_true, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_y_log10() +
+  theme_bw() +
+  labs(
+    title = "True topic-specific pseudo counts by condition",
+    y = "Pseudo count (log scale)"
+  )
+```
+```{r}
+pseudo_est <- theta_hat_aligned * rowSums(Y_ng)
+colnames(pseudo_est) <- paste0("Topic", 1:K)
+
+df_pseudo_est <- data.frame(
+  sample = 1:N,
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  pseudo_est
+)
+
+df_pseudo_est_long <- reshape2::melt(
+  df_pseudo_est,
+  id.vars = c("sample", "condition"),
+  variable.name = "topic",
+  value.name = "pseudo_count_est"
+)
+
+ggplot(df_pseudo_est_long, aes(x = condition, y = pseudo_count_est, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  facet_wrap(~ topic, scales = "free_y") +
+  scale_y_log10() +
+  theme_bw() +
+  labs(
+    title = "Estimated topic-specific pseudo counts by condition",
+    y = "Pseudo count (log scale)"
+  )
+```
+
+
+## all simulation
+```{r}
+library(MCMCpack)
+library(fastTopics)
+library(limma)
+library(clue)
+library(JuliaCall)
+
+# ============================================================
+# Julia setup for EPB
+# ============================================================
+julia_setup(JULIA_HOME = "/opt/anaconda3/julia_env/pyjuliapkg/install/bin")
+julia_command("import Pkg")
+julia_command('Pkg.activate("/opt/anaconda3/julia_env")')
+julia_command("using Empirikos, Hypatia, MultipleTesting")
+
+run_epb_pairs <- function(beta_hat, se_hat, df_resid, alpha = 0.05) {
+  beta_vec <- as.numeric(beta_hat)
+  se2_vec  <- as.numeric(se_hat^2)
+  nu_val   <- as.integer(df_resid[1])
+
+  julia_assign("beta_vec_r", beta_vec)
+  julia_assign("se2_vec_r", se2_vec)
+  julia_assign("nu_val_r", nu_val)
+  julia_assign("alpha_r", alpha)
+
+  julia_command("
+    samples_epb = [Empirikos.NormalChiSquareSample(beta_vec_r[i], se2_vec_r[i], nu_val_r)
+                   for i in eachindex(beta_vec_r)]
+  ")
+  julia_command("
+    test_epb_r = Empirikos.EmpiricalPartiallyBayesTTest(
+      α = alpha_r,
+      solver = Hypatia.Optimizer
+    )
+  ")
+  julia_command("res_epb_r = fit(test_epb_r, samples_epb)")
+
+  list(
+    adjp   = as.numeric(julia_eval('res_epb_r.adjp')),
+    rj_idx = as.logical(julia_eval('res_epb_r.rj_idx'))
+  )
+}
+
+# ============================================================
+# helpers
+# ============================================================
+compute_distance_matrix <- function(W_true, W_est) {
+  K <- nrow(W_true)
+  D <- matrix(NA_real_, K, K)
+  for (k in 1:K) {
+    for (j in 1:K) {
+      v1 <- W_true[k, ]
+      v2 <- W_est[j, ]
+      cos_sim <- sum(v1 * v2) / (sqrt(sum(v1^2) * sum(v2^2)) + 1e-20)
+      D[k, j] <- 1 - cos_sim
+    }
+  }
+  D
+}
+
+compute_topic_error <- function(W_true, W_est) {
+  diffs <- sqrt(rowSums((W_true - W_est)^2))
+  list(
+    per_topic = diffs,
+    mean_error = mean(diffs),
+    max_error = max(diffs)
+  )
+}
+
+get_metrics <- function(disc, truth) {
+  power <- mean(disc[truth])
+  n_disc <- sum(disc)
+  fdr <- if (n_disc == 0) 0 else sum(disc & !truth) / n_disc
+  c(power = power, fdr = fdr, n_disc = n_disc)
+}
+
+# ============================================================
+# one Option 2 simulation run
+# ============================================================
+run_one_option2 <- function(seed,
+                            N = 1000,
+                            G = 500,
+                            K = 6,
+                            n_diff = 2,
+                            beta_strength = 2,
+                            eps = 1e-8) {
+  set.seed(seed)
+
+  # 1. condition
+  X <- rbinom(N, 1, 0.5)
+
+  # 2. true topic effects
+  mu_k <- rnorm(K, 0, 0.5)
+
+  diff_k <- rep(FALSE, K)
+  diff_idx <- sample(1:K, n_diff, replace = FALSE)
+  diff_k[diff_idx] <- TRUE
+
+  beta_k <- ifelse(diff_k, beta_strength, 0)
+
+  # 3. latent logits and intensities
+  eta <- matrix(NA_real_, nrow = N, ncol = K)
+  for (k in 1:K) {
+    eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  }
+  E_true <- exp(eta)
+
+  # 4. true topic-gene matrix
+  T_mat <- matrix(rlnorm(K * G, meanlog = 0, sdlog = 1), K, G)
+  W_true <- matrix(NA_real_, nrow = K, ncol = G)
+  for (k in 1:K) {
+    W_true[k, ] <- rdirichlet(1, alpha = T_mat[k, ])
+  }
+
+  # 5. counts
+  library_size <- runif(N, 1000, 10000)
+  mean_ng <- (E_true %*% W_true) * library_size
+  Y_ng <- matrix(rpois(N * G, lambda = as.vector(mean_ng)), N, G)
+
+  # 6. fit fastTopics
+  fit <- fit_poisson_nmf(Y_ng, k = K, numiter = 200, verbose = "none")
+  fit_multinom <- poisson2multinom(fit)
+
+  theta_hat <- fit_multinom$L
+  beta_hat  <- fit_multinom$F
+
+  # 7. align topics
+  D <- compute_distance_matrix(W_true, t(beta_hat))
+  assignment <- solve_LSAP(D)
+
+  theta_hat_aligned <- theta_hat[, assignment, drop = FALSE]
+  beta_hat_aligned  <- beta_hat[, assignment, drop = FALSE]
+  W_est_aligned     <- t(beta_hat_aligned)
+
+  err <- compute_topic_error(W_true, W_est_aligned)
+
+  # 8. pairwise truth
+  pair_mat <- t(combn(K, 2))
+  n_pairs <- nrow(pair_mat)
+
+  pair_true <- apply(pair_mat, 1, function(idx) {
+    diff_k[idx[1]] != diff_k[idx[2]]
+  })
+
+  # 9. estimated pairwise log-ratios
+  log_ratio_mat_est <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+  colnames(log_ratio_mat_est) <- apply(pair_mat, 1, function(idx) {
+    paste0("T", idx[1], "_vs_T", idx[2])
+  })
+
+  for (p in 1:n_pairs) {
+    k1 <- pair_mat[p, 1]
+    k2 <- pair_mat[p, 2]
+    log_ratio_mat_est[, p] <- log(theta_hat_aligned[, k1] + eps) -
+                              log(theta_hat_aligned[, k2] + eps)
+  }
+
+  # 10. ordinary + limma
+  design <- model.matrix(~ X)
+  fit0 <- lmFit(t(log_ratio_mat_est), design)
+
+  coef_hat <- fit0$coefficients[, 2]
+  se_hat   <- fit0$stdev.unscaled[, 2] * fit0$sigma
+
+  # ordinary
+  t_ord <- coef_hat / se_hat
+  p_ord <- 2 * pt(-abs(t_ord), df = fit0$df.residual)
+  q_ord <- p.adjust(p_ord, method = "BH")
+  disc_ord <- q_ord < 0.05
+
+  # limma
+  fit_eb <- eBayes(fit0)
+  q_limma <- p.adjust(fit_eb$p.value[, 2], method = "BH")
+  disc_limma <- q_limma < 0.05
+
+  # EPB
+  epb_res <- run_epb_pairs(
+    beta_hat = coef_hat,
+    se_hat   = se_hat,
+    df_resid = fit0$df.residual,
+    alpha    = 0.05
+  )
+  disc_epb <- epb_res$rj_idx
+
+  list(
+    truth = list(diff_k = diff_k, beta_k = beta_k, pair_true = pair_true),
+    topic_error = err,
+    ordinary = get_metrics(disc_ord, pair_true),
+    limma    = get_metrics(disc_limma, pair_true),
+    epb      = get_metrics(disc_epb, pair_true)
+  )
+}
+```
+
+```{r}
+R <- 50
+
+res_list <- lapply(1:R, function(r) run_one_option2(seed = r))
+
+summary_df <- data.frame(
+  sim = 1:R,
+
+  power_ord = sapply(res_list, function(x) x$ordinary["power"]),
+  fdr_ord   = sapply(res_list, function(x) x$ordinary["fdr"]),
+  ndisc_ord = sapply(res_list, function(x) x$ordinary["n_disc"]),
+
+  power_limma = sapply(res_list, function(x) x$limma["power"]),
+  fdr_limma   = sapply(res_list, function(x) x$limma["fdr"]),
+  ndisc_limma = sapply(res_list, function(x) x$limma["n_disc"]),
+
+  power_epb = sapply(res_list, function(x) x$epb["power"]),
+  fdr_epb   = sapply(res_list, function(x) x$epb["fdr"]),
+  ndisc_epb = sapply(res_list, function(x) x$epb["n_disc"]),
+
+  mean_topic_err = sapply(res_list, function(x) x$topic_error$mean_error),
+  max_topic_err  = sapply(res_list, function(x) x$topic_error$max_error)
+)
+
+summary_df
+```
+
+```{r}
+cat("=== Ordinary ===\n")
+cat("Mean power =", round(mean(summary_df$power_ord), 3), "\n")
+cat("Mean empirical FDR =", round(mean(summary_df$fdr_ord), 3), "\n")
+cat("Mean number of discoveries =", round(mean(summary_df$ndisc_ord), 3), "\n\n")
+
+cat("=== limma ===\n")
+cat("Mean power =", round(mean(summary_df$power_limma), 3), "\n")
+cat("Mean empirical FDR =", round(mean(summary_df$fdr_limma), 3), "\n")
+cat("Mean number of discoveries =", round(mean(summary_df$ndisc_limma), 3), "\n\n")
+
+cat("=== EPB ===\n")
+cat("Mean power =", round(mean(summary_df$power_epb), 3), "\n")
+cat("Mean empirical FDR =", round(mean(summary_df$fdr_epb), 3), "\n")
+cat("Mean number of discoveries =", round(mean(summary_df$ndisc_epb), 3), "\n\n")
+
+cat("=== Topic recovery error ===\n")
+cat("Mean topic error =", round(mean(summary_df$mean_topic_err), 4), "\n")
+cat("Mean max topic error =", round(mean(summary_df$max_topic_err), 4), "\n")
+```
+
