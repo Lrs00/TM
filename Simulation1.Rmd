@@ -1,0 +1,550 @@
+---
+title: "Simulation"
+output: pdf_document
+date: "2026-04-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## option A
+
+```{r}
+library(limma)
+
+R <- 100
+
+power_vec <- numeric(R)
+fdr_vec <- numeric(R)
+n_disc_vec <- numeric(R)
+
+for (r in 1:R) {
+  set.seed(r)
+
+  N <- 1000
+  K <- 6
+  n_diff <- 2
+  beta_strength <- 2
+  eps <- 1e-8
+
+  X <- rbinom(N, 1, 0.5)
+  mu_k <- rnorm(K, 0, 1)
+
+  diff_k <- rep(FALSE, K)
+  diff_idx <- sample(1:K, n_diff)
+  diff_k[diff_idx] <- TRUE
+
+  beta_k <- ifelse(diff_k, beta_strength, 0)
+
+  eta <- matrix(NA_real_, nrow = N, ncol = K)
+  for (k in 1:K) {
+    eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  }
+
+  softmax <- function(v) exp(v) / sum(exp(v))
+  Z <- t(apply(eta, 1, softmax))
+
+  pair_mat <- t(combn(K, 2))
+  n_pairs <- nrow(pair_mat)
+
+  log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+  for (p in 1:n_pairs) {
+    k1 <- pair_mat[p, 1]
+    k2 <- pair_mat[p, 2]
+    log_ratio_mat[, p] <- log(Z[, k1] + eps) - log(Z[, k2] + eps)
+  }
+
+  pair_true <- apply(pair_mat, 1, function(idx) {
+    diff_k[idx[1]] != diff_k[idx[2]]
+  })
+
+  design <- model.matrix(~ X)
+  fit <- lmFit(t(log_ratio_mat), design)
+  fit <- eBayes(fit)
+  res <- topTable(fit, coef = 2, number = Inf, sort.by = "none")
+
+  disc <- res$adj.P.Val < 0.05
+
+  power_vec[r] <- mean(disc[pair_true])
+
+  n_disc <- sum(disc)
+  n_disc_vec[r] <- n_disc
+  fdr_vec[r] <- if (n_disc == 0) 0 else sum(disc & !pair_true) / n_disc
+}
+
+cat("Mean power over", R, "sims =", round(mean(power_vec), 3), "\n")
+cat("Mean empirical FDR over", R, "sims =", round(mean(fdr_vec), 3), "\n")
+cat("Mean number of discoveries =", round(mean(n_disc_vec), 3), "\n")
+```
+
+
+
+```{r}
+library(limma)
+library(JuliaCall)
+
+# -----------------------------
+# Julia setup for EPB
+# -----------------------------
+julia_setup(JULIA_HOME = "/opt/anaconda3/julia_env/pyjuliapkg/install/bin")
+julia_command("import Pkg")
+julia_command('Pkg.activate("/opt/anaconda3/julia_env")')
+julia_command("using Empirikos, Hypatia, MultipleTesting")
+
+run_epb_pairs <- function(beta_hat, se_hat, df_resid, alpha = 0.05) {
+  beta_vec <- as.numeric(beta_hat)
+  se2_vec  <- as.numeric(se_hat^2)
+  nu_val   <- as.integer(df_resid[1])
+
+  julia_assign("beta_vec_r", beta_vec)
+  julia_assign("se2_vec_r", se2_vec)
+  julia_assign("nu_val_r", nu_val)
+  julia_assign("alpha_r", alpha)
+
+  julia_command("
+    samples_epb = [Empirikos.NormalChiSquareSample(beta_vec_r[i], se2_vec_r[i], nu_val_r)
+                   for i in eachindex(beta_vec_r)]
+  ")
+  julia_command("
+    test_epb_r = Empirikos.EmpiricalPartiallyBayesTTest(
+      α = alpha_r,
+      solver = Hypatia.Optimizer
+    )
+  ")
+  julia_command("res_epb_r = fit(test_epb_r, samples_epb)")
+
+  list(
+    adjp   = as.numeric(julia_eval("res_epb_r.adjp")),
+    rj_idx = as.logical(julia_eval("res_epb_r.rj_idx"))
+  )
+}
+
+# -----------------------------
+# simulation comparison
+# -----------------------------
+R <- 100
+
+power_ord <- numeric(R)
+fdr_ord   <- numeric(R)
+ndisc_ord <- numeric(R)
+
+power_limma <- numeric(R)
+fdr_limma   <- numeric(R)
+ndisc_limma <- numeric(R)
+
+power_epb <- numeric(R)
+fdr_epb   <- numeric(R)
+ndisc_epb <- numeric(R)
+
+for (r in 1:R) {
+  set.seed(r)
+
+  N <- 1000
+  K <- 6
+  n_diff <- 2
+  beta_strength <- 2
+  eps <- 1e-8
+
+  # -----------------------------
+  # simulate one dataset
+  # -----------------------------
+  X <- rbinom(N, 1, 0.5)
+  mu_k <- rnorm(K, 0, 1)
+
+  diff_k <- rep(FALSE, K)
+  diff_idx <- sample(1:K, n_diff)
+  diff_k[diff_idx] <- TRUE
+
+  # same effect size for all true topics
+  beta_k <- ifelse(diff_k, beta_strength, 0)
+
+  eta <- matrix(NA_real_, nrow = N, ncol = K)
+  for (k in 1:K) {
+    eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+  }
+
+  softmax <- function(v) exp(v) / sum(exp(v))
+  Z <- t(apply(eta, 1, softmax))
+
+  # -----------------------------
+  # pairwise log-ratios
+  # -----------------------------
+  pair_mat <- t(combn(K, 2))
+  n_pairs <- nrow(pair_mat)
+
+  log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+  colnames(log_ratio_mat) <- apply(pair_mat, 1, function(idx) {
+    paste0("T", idx[1], "_vs_T", idx[2])
+  })
+
+  for (p in 1:n_pairs) {
+    k1 <- pair_mat[p, 1]
+    k2 <- pair_mat[p, 2]
+    log_ratio_mat[, p] <- log(Z[, k1] + eps) - log(Z[, k2] + eps)
+  }
+
+  # pair truth: one true and one false = non-null
+  pair_true <- apply(pair_mat, 1, function(idx) {
+    diff_k[idx[1]] != diff_k[idx[2]]
+  })
+
+  # -----------------------------
+  # fit ordinary / limma
+  # -----------------------------
+  design <- model.matrix(~ X)
+  fit0 <- lmFit(t(log_ratio_mat), design)
+
+  coef_hat <- fit0$coefficients[, 2]
+  se_hat   <- fit0$stdev.unscaled[, 2] * fit0$sigma
+
+  # ordinary t-test
+  t_ord <- coef_hat / se_hat
+  p_ord <- 2 * pt(-abs(t_ord), df = fit0$df.residual)
+  q_ord <- p.adjust(p_ord, method = "BH")
+  disc_ord <- q_ord < 0.05
+
+  # limma
+  fit_eb <- eBayes(fit0)
+  q_limma <- p.adjust(fit_eb$p.value[, 2], method = "BH")
+  disc_limma <- q_limma < 0.05
+
+  # EPB
+  epb_res <- run_epb_pairs(
+    beta_hat = coef_hat,
+    se_hat   = se_hat,
+    df_resid = fit0$df.residual,
+    alpha    = 0.05
+  )
+  disc_epb <- epb_res$rj_idx
+
+  # -----------------------------
+  # metrics helper
+  # -----------------------------
+  get_metrics <- function(disc, truth) {
+    power <- mean(disc[truth])
+    n_disc <- sum(disc)
+    fdr <- if (n_disc == 0) 0 else sum(disc & !truth) / n_disc
+    c(power = power, fdr = fdr, n_disc = n_disc)
+  }
+
+  m_ord   <- get_metrics(disc_ord,   pair_true)
+  m_limma <- get_metrics(disc_limma, pair_true)
+  m_epb   <- get_metrics(disc_epb,   pair_true)
+
+  power_ord[r] <- m_ord["power"]
+  fdr_ord[r]   <- m_ord["fdr"]
+  ndisc_ord[r] <- m_ord["n_disc"]
+
+  power_limma[r] <- m_limma["power"]
+  fdr_limma[r]   <- m_limma["fdr"]
+  ndisc_limma[r] <- m_limma["n_disc"]
+
+  power_epb[r] <- m_epb["power"]
+  fdr_epb[r]   <- m_epb["fdr"]
+  ndisc_epb[r] <- m_epb["n_disc"]
+}
+
+```
+```{r}
+cat("=== Ordinary t-test ===\n")
+cat("Mean power =", round(mean(power_ord), 3), "\n")
+cat("Mean empirical FDR =", round(mean(fdr_ord), 3), "\n")
+cat("Mean number of discoveries =", round(mean(ndisc_ord), 3), "\n\n")
+
+cat("=== limma ===\n")
+cat("Mean power =", round(mean(power_limma), 3), "\n")
+cat("Mean empirical FDR =", round(mean(fdr_limma), 3), "\n")
+cat("Mean number of discoveries =", round(mean(ndisc_limma), 3), "\n\n")
+
+cat("=== EPB ===\n")
+cat("Mean power =", round(mean(power_epb), 3), "\n")
+cat("Mean empirical FDR =", round(mean(fdr_epb), 3), "\n")
+cat("Mean number of discoveries =", round(mean(ndisc_epb), 3), "\n")
+```
+## one simulation
+```{r}
+library(ggplot2)
+library(reshape2)
+library(limma)
+
+set.seed(1)
+
+# -----------------------------
+# 1. Simulation settings
+# -----------------------------
+N <- 1000
+K <- 6
+n_diff <- 2
+beta_strength <- 2
+eps <- 1e-8
+
+# -----------------------------
+# 2. Condition
+# -----------------------------
+X <- rbinom(N, 1, 0.5)
+
+cat("Number in control:", sum(X == 0), "\n")
+cat("Number in treatment:", sum(X == 1), "\n")
+
+# -----------------------------
+# 3. True topic-level parameters
+# -----------------------------
+mu_k <- rnorm(K, 0, 0.5)
+
+diff_k <- rep(FALSE, K)
+diff_idx <- sample(1:K, n_diff)
+diff_k[diff_idx] <- TRUE
+
+# same effect size for all true topics
+beta_k <- ifelse(diff_k, beta_strength, 0)
+
+truth_topic <- data.frame(
+  topic = paste0("Topic", 1:K),
+  mu_k = round(mu_k, 3),
+  beta_k = round(beta_k, 3),
+  diff_k = diff_k
+)
+
+cat("\n=== True topic-level truth ===\n")
+print(truth_topic, row.names = FALSE)
+
+# -----------------------------
+# 4. Generate latent logits
+# -----------------------------
+eta <- matrix(NA_real_, nrow = N, ncol = K)
+for (k in 1:K) {
+  eta[, k] <- rnorm(N, mean = mu_k[k] + X * beta_k[k], sd = 1)
+}
+colnames(eta) <- paste0("Topic", 1:K)
+
+# -----------------------------
+# 5. Softmax to get true topic proportions
+# -----------------------------
+softmax <- function(v) exp(v) / sum(exp(v))
+Z <- t(apply(eta, 1, softmax))
+colnames(Z) <- paste0("Topic", 1:K)
+
+cat("\nCheck rows sum to 1:\n")
+print(summary(rowSums(Z)))
+
+# -----------------------------
+# 6. Topic-level summaries
+# -----------------------------
+mean_eta0 <- colMeans(eta[X == 0, , drop = FALSE])
+mean_eta1 <- colMeans(eta[X == 1, , drop = FALSE])
+
+eta_topic <- data.frame(
+  topic = paste0("Topic", 1:K),
+  eta_control = round(mean_eta0, 3),
+  eta_treatment = round(mean_eta1, 3),
+  eta_shift = round(mean_eta1 - mean_eta0, 3),
+  beta_k = round(beta_k, 3),
+  diff_k = diff_k
+)
+
+cat("\n=== Latent topic means by condition ===\n")
+print(eta_topic, row.names = FALSE)
+
+mean_Z0 <- colMeans(Z[X == 0, , drop = FALSE])
+mean_Z1 <- colMeans(Z[X == 1, , drop = FALSE])
+
+obs_topic <- data.frame(
+  topic = paste0("Topic", 1:K),
+  mean_control = round(mean_Z0, 4),
+  mean_treatment = round(mean_Z1, 4),
+  diff = round(mean_Z1 - mean_Z0, 4),
+  beta_k = round(beta_k, 3),
+  diff_k = diff_k
+)
+
+cat("\n=== Observed topic proportions by condition ===\n")
+print(obs_topic, row.names = FALSE)
+
+# -----------------------------
+# 7. Plot latent logits by condition
+# -----------------------------
+df_eta <- data.frame(
+  sample = 1:N,
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  eta
+)
+
+df_eta_long <- melt(
+  df_eta,
+  id.vars = c("sample", "condition"),
+  variable.name = "topic",
+  value.name = "eta_value"
+)
+
+ggplot(df_eta_long, aes(x = condition, y = eta_value, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Latent topic logits by condition",
+    y = expression(eta[nk])
+    
+  )
+
+# -----------------------------
+# 8. Plot topic proportions by condition
+# -----------------------------
+df_topic_plot <- data.frame(
+  sample = 1:N,
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  Z
+)
+
+df_topic_long <- melt(
+  df_topic_plot,
+  id.vars = c("sample", "condition"),
+  variable.name = "topic",
+  value.name = "proportion"
+)
+
+ggplot(df_topic_long, aes(x = condition, y = proportion, fill = condition)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.4) +
+  facet_wrap(~ topic, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "True topic proportions by condition",
+    y = "Topic proportion"
+  )
+
+# -----------------------------
+# 9. Pairwise truth
+# -----------------------------
+pair_mat <- t(combn(K, 2))
+
+pair_df <- data.frame(
+  pair = apply(pair_mat, 1, function(idx) paste0("T", idx[1], "_vs_T", idx[2])),
+  k1 = pair_mat[, 1],
+  k2 = pair_mat[, 2]
+)
+
+pair_df$diff_k1 <- diff_k[pair_df$k1]
+pair_df$diff_k2 <- diff_k[pair_df$k2]
+
+# current simulation truth:
+# one true and one false = non-null
+pair_df$pair_true <- pair_df$diff_k1 != pair_df$diff_k2
+
+pair_df$beta_k1 <- beta_k[pair_df$k1]
+pair_df$beta_k2 <- beta_k[pair_df$k2]
+pair_df$beta_diff <- pair_df$beta_k1 - pair_df$beta_k2
+
+pair_df$obs_shift <- sapply(seq_len(nrow(pair_df)), function(i) {
+  k1 <- pair_df$k1[i]
+  k2 <- pair_df$k2[i]
+  lr <- log(Z[, k1] + eps) - log(Z[, k2] + eps)
+  mean(lr[X == 1]) - mean(lr[X == 0])
+})
+
+pair_df$obs_shift <- round(pair_df$obs_shift, 3)
+
+cat("\n=== Pairwise truth table ===\n")
+print(
+  pair_df[, c("pair", "diff_k1", "diff_k2", "pair_true", "beta_diff", "obs_shift")],
+  row.names = FALSE
+)
+
+# -----------------------------
+# 10. Plot pairwise truth vs observed shift
+# -----------------------------
+ggplot(pair_df, aes(x = beta_diff, y = obs_shift, color = pair_true, label = pair)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.08, size = 3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  theme_bw() +
+  labs(
+    title = "True pairwise effect vs observed log-ratio shift",
+    x = "True beta difference",
+    y = "Observed mean log-ratio shift"
+  )
+
+# -----------------------------
+# 11. Fit one-run ordinary + limma
+# -----------------------------
+n_pairs <- nrow(pair_mat)
+
+log_ratio_mat <- matrix(NA_real_, nrow = N, ncol = n_pairs)
+colnames(log_ratio_mat) <- pair_df$pair
+
+for (p in 1:n_pairs) {
+  k1 <- pair_mat[p, 1]
+  k2 <- pair_mat[p, 2]
+  log_ratio_mat[, p] <- log(Z[, k1] + eps) - log(Z[, k2] + eps)
+}
+
+design <- model.matrix(~ X)
+fit0 <- lmFit(t(log_ratio_mat), design)
+
+coef_hat <- fit0$coefficients[, 2]
+se_hat <- fit0$stdev.unscaled[, 2] * fit0$sigma
+
+# ordinary
+t_ord <- coef_hat / se_hat
+p_ord <- 2 * pt(-abs(t_ord), df = fit0$df.residual)
+q_ord <- p.adjust(p_ord, method = "BH")
+disc_ord <- q_ord < 0.05
+
+# limma
+fit_eb <- eBayes(fit0)
+q_limma <- p.adjust(fit_eb$p.value[, 2], method = "BH")
+disc_limma <- q_limma < 0.05
+
+one_run_res <- data.frame(
+  pair = pair_df$pair,
+  pair_true = pair_df$pair_true,
+  beta_diff = pair_df$beta_diff,
+  obs_shift = pair_df$obs_shift,
+  coef_hat = round(coef_hat, 3),
+  se_hat = round(se_hat, 3),
+  q_ord = signif(q_ord, 3),
+  disc_ord = disc_ord,
+  q_limma = signif(q_limma, 3),
+  disc_limma = disc_limma
+)
+
+cat("\n=== One-run testing results ===\n")
+print(one_run_res, row.names = FALSE)
+
+# -----------------------------
+# 12. One pair in detail
+# -----------------------------
+k1 <- pair_mat[1, 1]
+k2 <- pair_mat[1, 2]
+pair_name <- paste0("T", k1, "_vs_T", k2)
+
+lr12 <- log(Z[, k1] + eps) - log(Z[, k2] + eps)
+
+df_pair12 <- data.frame(
+  condition = factor(X, levels = c(0, 1), labels = c("Control", "Treatment")),
+  log_ratio = lr12
+)
+
+cat("\n=== Detailed check for", pair_name, "===\n")
+cat("diff_k1 =", diff_k[k1], "\n")
+cat("diff_k2 =", diff_k[k2], "\n")
+cat("pair_true =", diff_k[k1] != diff_k[k2], "\n")
+cat("beta_1 =", beta_k[k1], "\n")
+cat("beta_2 =", beta_k[k2], "\n")
+cat("mean log-ratio in control =", round(mean(lr12[X == 0]), 3), "\n")
+cat("mean log-ratio in treatment =", round(mean(lr12[X == 1]), 3), "\n")
+cat("observed shift =", round(mean(lr12[X == 1]) - mean(lr12[X == 0]), 3), "\n")
+
+ggplot(df_pair12, aes(x = condition, y = log_ratio, fill = condition)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_bw() +
+  labs(
+    title = paste0(pair_name, " log-ratio by condition"),
+    y = paste0("log(T", k1, " / T", k2, ")")
+  )
+```
+
+
+
+
+
