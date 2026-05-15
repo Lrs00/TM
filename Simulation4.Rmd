@@ -1,0 +1,1694 @@
+---
+title: "Simulation4"
+output: pdf_document
+date: "2026-05-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Under CLR, compare 4 methods
+
+```{r}
+# Improved simulation framework for differential topic enrichment
+#
+# Main changes versus the original draft script:
+# 1. Generate true topic proportions with a logistic-normal / softmax model.
+# 2. Sample sequencing depth independently of condition and topic proportion.
+# 3. Generate counts from a negative-binomial model.
+# 4. Use fastTopics::poisson2multinom(...)$L directly as estimated topic proportions.
+# 5. Evaluate both oracle (true theta) and recovered (estimated theta) analyses.
+# 6. Compare CLR-topic testing variants: no moderation, limma eBayes, vashr,
+#    and mr.ashr.
+# 7. Provide diagnostics for true/fitted topics, topic memberships by condition,
+#    and matched topic recovery.
+#
+# Note:
+# The topic model fit below still uses Poisson NMF (fastTopics) on NB-generated
+# counts. That is deliberate if you want to assess robustness to model mismatch.
+
+library(MCMCpack)
+library(fastTopics)
+library(limma)
+library(clue)
+
+softmax_rows <- function(eta) {
+  eta <- as.matrix(eta)
+  eta <- sweep(eta, 1, apply(eta, 1, max), FUN = "-")
+  out <- exp(eta)
+  out / rowSums(out)
+}
+
+normalize_eps <- function(eps, K) {
+  if (length(eps) == 1L) {
+    eps <- rep(as.numeric(eps), K)
+  } else if (length(eps) != K) {
+    stop("eps must have length 1 or match the number of topics.", call. = FALSE)
+  } else {
+    eps <- as.numeric(eps)
+  }
+
+  if (any(!is.finite(eps)) || any(eps <= 0)) {
+    stop("eps values must be positive and finite.", call. = FALSE)
+  }
+  eps
+}
+
+topic_specific_eps <- function(theta, c0 = 1e-4, lower = 1e-12, upper = 1e-2) {
+  theta <- as.matrix(theta)
+  eps <- c0 * apply(theta, 2, stats::median, na.rm = TRUE)
+  pmin(pmax(eps, lower), upper)
+}
+
+safe_log_theta <- function(theta, eps = 1e-4) {
+  theta <- as.matrix(theta)
+  eps <- normalize_eps(eps, ncol(theta))
+  theta01 <- pmin(pmax(theta, 0), 1)
+  log(sweep(theta01, 2, eps, FUN = "+"))
+}
+
+logit_transform <- function(theta, eps = 1e-4) {
+  theta <- as.matrix(theta)
+  eps <- normalize_eps(eps, ncol(theta))
+  theta01 <- pmin(pmax(theta, 0), 1)
+  num <- sweep(theta01, 2, eps, FUN = "+")
+  den <- sweep(1 - theta01, 2, eps, FUN = "+")
+  log(num / den)
+}
+
+clr_transform <- function(theta, eps = 1e-4) {
+  z <- safe_log_theta(theta, eps = eps)
+  sweep(z, 1, rowMeans(z), FUN = "-")
+}
+
+# This creates the true topic-by-gene matrix 𝜙
+make_topic_gene_matrix <- function(K, G,
+                                   markers_per_topic = 40,
+                                   baseline_shape = 0.2,
+                                   marker_boost = 25,
+                                   allow_overlap = FALSE) {
+  if (!allow_overlap && K * markers_per_topic > G) {
+    stop("Need G >= K * markers_per_topic when allow_overlap = FALSE.", call. = FALSE)
+  }
+
+  phi <- matrix(0, nrow = K, ncol = G)
+  marker_list <- vector("list", K)
+  used <- integer(0)
+  baseline <- rgamma(G, shape = baseline_shape, rate = 1)
+
+  for (k in seq_len(K)) {
+    pool <- if (allow_overlap) seq_len(G) else setdiff(seq_len(G), used)
+    marker_idx <- sample(pool, markers_per_topic, replace = FALSE)
+    marker_list[[k]] <- marker_idx
+    used <- c(used, marker_idx)
+
+    alpha <- baseline
+    alpha[marker_idx] <- alpha[marker_idx] * marker_boost
+    phi[k, ] <- as.numeric(MCMCpack::rdirichlet(1, alpha + 1e-8))
+  }
+
+  colnames(phi) <- paste0("g", seq_len(G))
+  list(phi = phi, markers = marker_list)
+}
+
+## This creates the true condition-effect matrix 
+make_sparse_effects <- function(K, P = 1,
+                                n_nonzero_per_condition = 2,
+                                effect_size = 1.0,
+                                balanced = TRUE) {
+  B <- matrix(0, nrow = P, ncol = K)
+  rownames(B) <- paste0("x", seq_len(P))
+
+  for (p in seq_len(P)) {
+    idx <- sample(seq_len(K), n_nonzero_per_condition, replace = FALSE)
+    vals <- rep(effect_size, n_nonzero_per_condition)
+
+    if (balanced && n_nonzero_per_condition >= 2) {
+      half <- floor(n_nonzero_per_condition / 2)
+      vals[seq_len(half)] <- effect_size
+      vals[(half + 1):n_nonzero_per_condition] <- -effect_size
+      vals <- sample(vals)
+    } else {
+      vals <- sample(c(-1, 1), n_nonzero_per_condition, replace = TRUE) * effect_size
+    }
+
+    B[p, idx] <- vals
+  }
+
+  B
+}
+
+# It simulates true topic proportions using a logistic-normal / softmax model.
+simulate_topic_proportions <- function(X, B,
+                                       alpha_k = NULL,
+                                       sigma_eta = 0.6) {
+  X <- as.matrix(X)
+  N <- nrow(X)
+  K <- ncol(B)
+
+  if (ncol(X) != nrow(B)) {
+    stop("ncol(X) must equal nrow(B).", call. = FALSE)
+  }
+
+  if (is.null(alpha_k)) {
+    alpha_k <- rnorm(K, mean = 0, sd = 0.5)
+  }
+
+  eta_mean <- matrix(alpha_k, nrow = N, ncol = K, byrow = TRUE) + X %*% B
+  eta <- eta_mean + matrix(rnorm(N * K, sd = sigma_eta), nrow = N, ncol = K)
+  theta <- softmax_rows(eta)
+
+  list(theta = theta, eta = eta, eta_mean = eta_mean, alpha_k = alpha_k)
+}
+# This generates gene counts from the true topic proportions.
+simulate_nb_counts <- function(theta, phi, depth, size_g = 20) {
+  theta <- as.matrix(theta)
+  phi <- as.matrix(phi)
+  depth <- as.numeric(depth)
+
+  mu <- theta %*% phi
+  mu <- sweep(mu, 1, depth, FUN = "*")
+  mu <- pmax(mu, 1e-12)
+
+  G <- ncol(mu)
+  if (length(size_g) == 1L) {
+    size_g <- rep(size_g, G)
+  }
+  if (length(size_g) != G) {
+    stop("size_g must have length 1 or G.", call. = FALSE)
+  }
+
+  Y <- matrix(
+    rnbinom(
+      length(mu),
+      mu = as.vector(mu),
+      size = rep(size_g, each = nrow(mu))
+    ),
+    nrow = nrow(mu),
+    ncol = ncol(mu)
+  )
+  colnames(Y) <- colnames(phi)
+  Y
+}
+
+# Topic models do not preserve topic labels. Estimated topic 1 may really correspond to true topic 4.
+# So this function aligns fitted topics to the true topics.
+align_topics <- function(phi_true, theta_hat, phi_hat, eps = 1e-8) {
+  normalize_rows <- function(M) {
+    M / sqrt(rowSums(M^2))
+  }
+
+  log_true <- log(phi_true + eps)
+  log_hat <- log(phi_hat + eps)
+  S <- normalize_rows(log_true) %*% t(normalize_rows(log_hat))
+  perm <- as.vector(clue::solve_LSAP(S, maximum = TRUE))
+
+  list(
+    perm = perm,
+    theta = theta_hat[, perm, drop = FALSE],
+    phi = phi_hat[perm, , drop = FALSE],
+    matched_similarity = S[cbind(seq_len(nrow(S)), perm)]
+  )
+}
+
+make_pairwise_logratios <- function(theta, eps = 1e-4) {
+  theta <- as.matrix(theta)
+  K <- ncol(theta)
+  eps <- normalize_eps(eps, K)
+  pairs <- t(utils::combn(seq_len(K), 2))
+  out <- matrix(0, nrow = nrow(theta), ncol = nrow(pairs))
+
+  for (m in seq_len(nrow(pairs))) {
+    k <- pairs[m, 1]
+    l <- pairs[m, 2]
+    log_pair <- safe_log_theta(theta[, c(k, l), drop = FALSE], eps = eps[c(k, l)])
+    out[, m] <- log_pair[, 1] - log_pair[, 2]
+  }
+
+  colnames(out) <- apply(pairs, 1, function(z) paste0("T", z[1], "_vs_T", z[2]))
+  list(mat = out, pairs = pairs)
+}
+
+run_limma <- function(feature_matrix, design, coef_index = 2) {
+  fit <- limma::lmFit(t(feature_matrix), design)
+  fit <- limma::eBayes(fit)
+  limma::topTable(fit, coef = coef_index, number = Inf, sort.by = "none")
+}
+
+resolve_fit_topics <- function(fit) {
+  topics <- rownames(fit$coefficients)
+  if (is.null(topics)) {
+    topics <- paste0("T", seq_len(nrow(fit$coefficients)))
+  }
+  topics
+}
+## This gets results from plain linear regression without empirical Bayes moderation.
+extract_nomod_results <- function(fit, coef_index = 2, alpha = 0.05) {
+  topics <- resolve_fit_topics(fit)
+  betahat <- fit$coefficients[, coef_index]
+  se <- fit$stdev.unscaled[, coef_index] * fit$sigma
+  df_res <- fit$df.residual
+  if (length(df_res) == 1L) {
+    df_res <- rep(as.numeric(df_res), length(betahat))
+  } else {
+    df_res <- as.numeric(df_res)
+  }
+
+  ok <- is.finite(betahat) & is.finite(se) & (se > 0) & is.finite(df_res)
+  t_stat <- rep(NA_real_, length(betahat))
+  pval <- rep(NA_real_, length(betahat))
+  t_stat[ok] <- betahat[ok] / se[ok]
+  pval[ok] <- 2 * stats::pt(-abs(t_stat[ok]), df = df_res[ok])
+  qval <- stats::p.adjust(pval, method = "BH")
+
+  data.frame(
+    topic = topics,
+    method = "no_eb",
+    effect = betahat,
+    SE = se,
+    df = df_res,
+    p_value = pval,
+    q_value = qval,
+    lfsr = NA_real_,
+    detected = qval < alpha,
+    available = TRUE,
+    stringsAsFactors = FALSE
+  )
+}
+## extract_limma_results
+extract_limma_results <- function(fit, coef_index = 2, alpha = 0.05) {
+  tt <- limma::topTable(fit, coef = coef_index, number = Inf, sort.by = "none")
+  n_topics <- nrow(tt)
+  df_col <- if ("df.total" %in% names(tt)) tt$df.total else rep(NA_real_, n_topics)
+  qval <- tt$adj.P.Val
+  data.frame(
+    topic = rownames(tt),
+    method = "limma",
+    effect = tt$logFC,
+    SE = NA_real_,
+    df = df_col,
+    p_value = tt$P.Value,
+    q_value = qval,
+    lfsr = NA_real_,
+    detected = qval < alpha,
+    available = TRUE,
+    stringsAsFactors = FALSE
+  )
+}
+
+# extract_vash_results
+extract_vash_results <- function(fit, coef_index = 2, alpha = 0.05) {
+  topics <- resolve_fit_topics(fit)
+  if (!requireNamespace("vashr", quietly = TRUE)) {
+    return(data.frame(
+      topic = topics,
+      method = "vashr",
+      effect = NA_real_,
+      SE = NA_real_,
+      df = NA_real_,
+      p_value = NA_real_,
+      q_value = NA_real_,
+      lfsr = NA_real_,
+      detected = NA,
+      available = FALSE,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  sigma_hat <- fit$sigma
+  df_res <- as.numeric(fit$df.residual)
+  df_scalar <- unique(df_res[is.finite(df_res)])
+  df_scalar <- if (length(df_scalar) == 1L) df_scalar else stats::median(df_scalar)
+
+  vfit <- vashr::vash(sehat = sigma_hat, df = df_scalar)
+
+  betahat <- fit$coefficients[, coef_index]
+  unscaled <- fit$stdev.unscaled[, coef_index]
+  se_raw <- unscaled * sigma_hat
+  sigma_post <- vfit$sd.post
+  se_mix <- sweep(sqrt(vfit$PosteriorRate / vfit$PosteriorShape), 1, unscaled, "*")
+  pval <- vashr::mod_t_test(
+    betahat = betahat,
+    se = se_mix,
+    pi = vfit$PosteriorPi,
+    df = 2 * vfit$PosteriorShape
+  )
+  qval <- stats::p.adjust(pval, method = "BH")
+
+  data.frame(
+    topic = topics,
+    method = "vashr",
+    effect = betahat,
+    SE = se_raw,
+    df = rep(df_scalar, length(betahat)),
+    p_value = pval,
+    q_value = qval,
+    lfsr = NA_real_,
+    detected = qval < alpha,
+    available = TRUE,
+    stringsAsFactors = FALSE
+  )
+}
+## Instead of topic-by-topic regression, this does a joint multivariate regression: 
+## q-values from adjusted lfsr
+residualize_against <- function(y, covariates) {
+  if (is.null(covariates) || !ncol(as.matrix(covariates))) {
+    return(y)
+  }
+  Q <- qr(cbind(1, as.matrix(covariates)))
+  qr.resid(Q, y)
+}
+
+extract_mr_ash_results <- function(feature_matrix,
+                                   design,
+                                   coef_index = 2,
+                                   alpha = 0.05,
+                                   standardize = TRUE,
+                                   control = list(max.iter = 200)) {
+  topics <- colnames(feature_matrix)
+  if (is.null(topics)) {
+    topics <- paste0("T", seq_len(ncol(feature_matrix)))
+  }
+
+  if (!requireNamespace("mr.ashr", quietly = TRUE)) {
+    return(data.frame(
+      topic = topics,
+      method = "mr.ashr",
+      effect = NA_real_,
+      SE = NA_real_,
+      df = NA_real_,
+      p_value = NA_real_,
+      q_value = NA_real_,
+      lfsr = NA_real_,
+      detected = NA,
+      available = FALSE,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  y_use <- as.numeric(design[, coef_index])
+  nuisance_idx <- setdiff(seq_len(ncol(design)), c(1L, coef_index))
+  X_use <- as.matrix(feature_matrix)
+  intercept <- TRUE
+
+  if (length(nuisance_idx)) {
+    nuisance <- design[, nuisance_idx, drop = FALSE]
+    y_use <- residualize_against(y_use, nuisance)
+    X_use <- residualize_against(X_use, nuisance)
+    intercept <- FALSE
+  }
+
+  # Mr.ASH is a joint multiple-regression model, so here the condition is
+  # treated as the response and CLR topics are the predictors.
+  fit_mr_ash <- mr.ashr::fit_mr_ash(
+    X = X_use,
+    y = y_use,
+    standardize = standardize,
+    intercept = intercept,
+    control = control,
+    verbose = "none"
+  )
+
+  lfsr <- as.numeric(fit_mr_ash$lfsr)
+  qval <- stats::p.adjust(lfsr, method = "BH")
+
+  data.frame(
+    topic = topics,
+    method = "mr.ashr",
+    effect = as.numeric(fit_mr_ash$b),
+    SE = NA_real_,
+    df = NA_real_,
+    p_value = NA_real_,
+    q_value = qval,
+    lfsr = lfsr,
+    detected = lfsr < alpha,
+    available = TRUE,
+    stringsAsFactors = FALSE
+  )
+}
+
+score_calls <- function(detected, truth) {
+  if (all(is.na(detected))) {
+    return(c(TP = NA_real_, FP = NA_real_, power = NA_real_, FDP = NA_real_))
+  }
+
+  detected <- as.logical(detected)
+  detected[is.na(detected)] <- FALSE
+  truth <- as.logical(truth)
+
+  TP <- sum(detected & truth)
+  FP <- sum(detected & !truth)
+  c(
+    TP = TP,
+    FP = FP,
+    power = if (sum(truth) == 0) NA_real_ else TP / sum(truth),
+    FDP = if (sum(detected) == 0) 0 else FP / sum(detected)
+  )
+}
+## Averages TP, FP, power, FDP over simulations, and renames FDP to FDR in the summary table.
+summarize_method_metrics <- function(metrics_df) {
+  out <- aggregate(cbind(TP, FP, power, FDP) ~ method, data = metrics_df, FUN = mean)
+  names(out)[names(out) == "FDP"] <- "FDR"
+  out
+}
+
+true_pairwise_summaries <- function(beta_k) {
+  D <- outer(beta_k, beta_k, FUN = "-")
+  absD <- abs(D)
+  diag(absD) <- NA_real_
+  list(
+    D = D,
+    Smin = apply(absD, 1, min, na.rm = TRUE),
+    Smed = apply(absD, 1, stats::median, na.rm = TRUE),
+    Smax = apply(absD, 1, max, na.rm = TRUE),
+    frac_nonzero = apply(absD > 1e-12, 1, mean, na.rm = TRUE)
+  )
+}
+
+pairwise_topic_summaries <- function(theta, design,
+                                     coef_index = 2,
+                                     eps = 1e-4,
+                                     alpha = 0.05) {
+  pw <- make_pairwise_logratios(theta, eps = eps)
+  tt <- run_limma(pw$mat, design = design, coef_index = coef_index)
+  q <- p.adjust(tt$P.Value, method = "BH")
+
+  K <- ncol(theta)
+  Bhat <- matrix(0, nrow = K, ncol = K)
+  Qmat <- matrix(NA_real_, nrow = K, ncol = K)
+
+  for (m in seq_len(nrow(pw$pairs))) {
+    k <- pw$pairs[m, 1]
+    l <- pw$pairs[m, 2]
+    Bhat[k, l] <- tt$logFC[m]
+    Bhat[l, k] <- -tt$logFC[m]
+    Qmat[k, l] <- q[m]
+    Qmat[l, k] <- q[m]
+  }
+
+  absB <- abs(Bhat)
+  diag(absB) <- NA_real_
+
+  list(
+    beta = Bhat,
+    q = Qmat,
+    Smin = apply(absB, 1, min, na.rm = TRUE),
+    Smed = apply(absB, 1, stats::median, na.rm = TRUE),
+    Smax = apply(absB, 1, max, na.rm = TRUE),
+    fracSig = apply(Qmat < alpha, 1, mean, na.rm = TRUE)
+  )
+}
+
+# fit_clr_method_comparison <- function(theta,
+#                                       design,
+#                                       truth_clr,
+#                                       truth_clr_effect,
+#                                       coef_index = 2,
+#                                       eps_c0 = 1e-4,
+#                                       alpha = 0.05) {
+#   eps_k <- topic_specific_eps(theta, c0 = eps_c0)
+#   theta_clr <- clr_transform(theta, eps = eps_k)
+# 
+#   fit_lm <- limma::lmFit(t(theta_clr), design)
+#   fit_eb <- limma::eBayes(fit_lm)
+# 
+#   method_results <- list(
+#     no_eb = extract_nomod_results(fit_lm, coef_index = coef_index, alpha = alpha),
+#     limma = extract_limma_results(fit_eb, coef_index = coef_index, alpha = alpha),
+#     vashr = extract_vash_results(fit_lm, coef_index = coef_index, alpha = alpha),
+#     mr.ashr = extract_mr_ash_results(theta_clr, design, coef_index = coef_index, alpha = alpha)
+#   )
+# 
+#   results_long <- do.call(
+#     rbind,
+#     lapply(method_results, function(df) {
+#       df$truth <- truth_clr[match(df$topic, names(truth_clr))]
+#       df$truth_effect <- truth_clr_effect[match(df$topic, names(truth_clr_effect))]
+#       df
+#     })
+#   )
+#   rownames(results_long) <- NULL
+# 
+#   metrics <- do.call(
+#     rbind,
+#     lapply(method_results, function(df) {
+#       df$truth <- truth_clr[match(df$topic, names(truth_clr))]
+#       score_calls(df$detected, df$truth)
+#     })
+#   )
+# 
+#   list(
+#     theta_clr = theta_clr,
+#     eps_k = eps_k,
+#     results = method_results,
+#     results_long = results_long,
+#     metrics = metrics
+#   )
+# }
+
+
+build_condition_labels <- function(X) {
+  X <- as.matrix(X)
+  if (ncol(X) == 1L) {
+    labels <- paste0(colnames(X), "=", X[, 1])
+  } else {
+    labels <- apply(
+      X,
+      1,
+      function(z) paste0(colnames(X), "=", z, collapse = ", ")
+    )
+  }
+  factor(labels, levels = unique(labels))
+}
+
+prepare_theta_long <- function(theta, X) {
+  theta <- as.matrix(theta)
+  data.frame(
+    sample = rep(seq_len(nrow(theta)), times = ncol(theta)),
+    condition = rep(build_condition_labels(X), times = ncol(theta)),
+    topic = factor(rep(colnames(theta), each = nrow(theta)), levels = colnames(theta)),
+    value = as.vector(theta),
+    stringsAsFactors = FALSE
+  )
+}
+
+select_topic_panel_genes <- function(phi, top_n = 12) {
+  phi <- as.matrix(phi)
+  top_n <- min(top_n, ncol(phi))
+  idx <- integer(0)
+  for (k in seq_len(nrow(phi))) {
+    idx <- c(idx, order(phi[k, ], decreasing = TRUE)[seq_len(top_n)])
+  }
+  unique(idx)
+}
+
+prepare_topic_gene_long <- function(phi, gene_idx = NULL) {
+  phi <- as.matrix(phi)
+  if (is.null(gene_idx)) {
+    gene_idx <- select_topic_panel_genes(phi)
+  }
+  gene_idx <- unique(gene_idx)
+  genes <- colnames(phi)[gene_idx]
+  if (is.null(genes)) {
+    genes <- paste0("g", gene_idx)
+  }
+
+  data.frame(
+    topic = factor(rep(rownames(phi), each = length(gene_idx)), levels = rev(rownames(phi))),
+    gene = factor(rep(genes, times = nrow(phi)), levels = genes),
+    weight = as.vector(t(phi[, gene_idx, drop = FALSE])),
+    stringsAsFactors = FALSE
+  )
+}
+## heatmap of topic-gene weights
+plot_topic_gene_heatmap <- function(phi, title_text, top_n = 12) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The 'ggplot2' package is required for plotting.", call. = FALSE)
+  }
+
+  df <- prepare_topic_gene_long(phi, gene_idx = select_topic_panel_genes(phi, top_n = top_n))
+
+  ggplot2::ggplot(df, ggplot2::aes(x = gene, y = topic, fill = weight)) +
+    ggplot2::geom_tile() +
+    ggplot2::scale_fill_gradient(low = "white", high = "#2166ac") +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1),
+      panel.grid = ggplot2::element_blank()
+    ) +
+    ggplot2::labs(
+      x = "Top topic genes",
+      y = "Topic",
+      fill = "Weight",
+      title = title_text
+    )
+}
+## boxplots of topic membership by condition
+plot_topic_membership <- function(theta, X, title_text) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The 'ggplot2' package is required for plotting.", call. = FALSE)
+  }
+
+  df <- prepare_theta_long(theta, X)
+
+  ggplot2::ggplot(df, ggplot2::aes(x = condition, y = value, fill = condition)) +
+    ggplot2::geom_boxplot(outlier.size = 0.5, outlier.alpha = 0.35) +
+    ggplot2::facet_wrap(~ topic, scales = "free_y", ncol = 3) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      legend.position = "none",
+      axis.text.x = ggplot2::element_text(angle = 30, hjust = 1)
+    ) +
+    ggplot2::labs(
+      x = "Condition",
+      y = "Topic membership",
+      title = title_text
+    )
+}
+## similarity of matched topics
+plot_alignment_similarity <- function(matched_similarity) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The 'ggplot2' package is required for plotting.", call. = FALSE)
+  }
+
+  df <- data.frame(
+    topic = factor(paste0("T", seq_along(matched_similarity)), levels = paste0("T", seq_along(matched_similarity))),
+    similarity = as.numeric(matched_similarity),
+    stringsAsFactors = FALSE
+  )
+
+  ggplot2::ggplot(df, ggplot2::aes(x = topic, y = similarity)) +
+    ggplot2::geom_col(fill = "#1b9e77") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      x = "Matched topic",
+      y = "Cosine similarity",
+      title = "True-vs-fitted topic alignment"
+    )
+}
+## power/FDR across simulations
+plot_clr_method_performance <- function(per_simulation_df) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The 'ggplot2' package is required for plotting.", call. = FALSE)
+  }
+# 
+#   method_levels <- c("no_eb", "limma", "vashr", "mr.ashr")
+  method_levels <- c("no_eb", "limma", "vashr", "epb_np", "mr.ashr")
+  df_long <- rbind(
+    data.frame(
+      sim = per_simulation_df$sim,
+      method = per_simulation_df$method,
+      metric = "Power",
+      value = per_simulation_df$power,
+      stringsAsFactors = FALSE
+    ),
+    data.frame(
+      sim = per_simulation_df$sim,
+      method = per_simulation_df$method,
+      metric = "FDR",
+      value = per_simulation_df$FDP,
+      stringsAsFactors = FALSE
+    )
+  )
+  df_long$method <- factor(df_long$method, levels = method_levels)
+
+  summary_long <- aggregate(value ~ method + metric, data = df_long, FUN = mean)
+
+  ggplot2::ggplot(df_long, ggplot2::aes(x = method, y = value, color = method)) +
+    ggplot2::geom_jitter(width = 0.12, alpha = 0.5, size = 1.4) +
+    ggplot2::geom_point(
+      data = summary_long,
+      mapping = ggplot2::aes(x = method, y = value),
+      inherit.aes = FALSE,
+      color = "black",
+      size = 2.8
+    ) +
+    ggplot2::facet_wrap(~ metric, scales = "free_y") +
+    ggplot2::theme_bw() +
+    ggplot2::theme(legend.position = "none") +
+    ggplot2::labs(
+      x = "Method",
+      y = "Across-simulation estimate",
+      title = "CLR method performance across simulations"
+    )
+}
+
+build_diagnostic_plots <- function(simulation, study = NULL, top_n_genes = 12) {
+  plots <- list(
+    ground_truth_topics = plot_topic_gene_heatmap(
+      simulation$phi_true,
+      title_text = "Ground-truth topic-gene weights",
+      top_n = top_n_genes
+    ),
+    fitted_topics = plot_topic_gene_heatmap(
+      simulation$phi_hat,
+      title_text = "Fitted topic-gene weights (aligned to truth)",
+      top_n = top_n_genes
+    ),
+    true_membership = plot_topic_membership(
+      simulation$theta_true,
+      simulation$X,
+      title_text = "Ground-truth topic memberships by condition"
+    ),
+    fitted_membership = plot_topic_membership(
+      simulation$theta_hat,
+      simulation$X,
+      title_text = "Recovered topic memberships by condition"
+    ),
+    alignment = plot_alignment_similarity(simulation$matched_similarity)
+  )
+
+  if (!is.null(study)) {
+    plots$clr_method_performance <- plot_clr_method_performance(study$per_simulation)
+  }
+
+  plots
+}
+
+save_simulation_outputs <- function(simulation,
+                                    study = NULL,
+                                    output_dir = file.path("simulations", "results", "improved_topic_simulation"),
+                                    top_n_genes = 12,
+                                    width = 10,
+                                    height = 7,
+                                    dpi = 150) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The 'ggplot2' package is required for plotting.", call. = FALSE)
+  }
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+  write.csv(
+    simulation$clr_truth,
+    file.path(output_dir, "single_simulation_clr_truth.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    simulation$clr_results_long,
+    file.path(output_dir, "single_simulation_clr_method_results.csv"),
+    row.names = FALSE
+  )
+  write.csv(
+    data.frame(topic = names(simulation$matched_similarity), similarity = simulation$matched_similarity),
+    file.path(output_dir, "single_simulation_topic_alignment.csv"),
+    row.names = FALSE
+  )
+
+  if (!is.null(study)) {
+    write.csv(
+      study$per_simulation,
+      file.path(output_dir, "clr_method_metrics_per_simulation.csv"),
+      row.names = FALSE
+    )
+    write.csv(
+      study$summary,
+      file.path(output_dir, "clr_method_metrics_summary.csv"),
+      row.names = FALSE
+    )
+  }
+
+  plots <- build_diagnostic_plots(simulation, study = study, top_n_genes = top_n_genes)
+  for (nm in names(plots)) {
+    ggplot2::ggsave(
+      filename = file.path(output_dir, paste0(nm, ".png")),
+      plot = plots[[nm]],
+      width = width,
+      height = height,
+      dpi = dpi
+    )
+  }
+
+  saveRDS(
+    list(simulation = simulation, study = study),
+    file = file.path(output_dir, "improved_topic_simulation_results.rds")
+  )
+
+  invisible(output_dir)
+}
+### P: Number of covariates / conditions in the design matrix 
+### B: rue effect matrix for covariates on topics, of dimension P×K.
+### n_nonzero_per_condition: Used only when B = NULL.
+### effect_size: Magnitude of the nonzero entries in B when B = NULL.
+### balanced:Used only when B = NULL
+## di∼LogNormal(depth_meanlog,depth_sdlog2)
+## sg∼Gamma(nb_size_shape,nb_size_rate) (These control the gene-specific negative-binomial size parameters.)
+## Number of marker genes assigned to each topic. These marker genes get larger weights in the topic-gene distribution, so topics become more distinguishable. Larger values usually make topic recovery easier.
+one_simulation <- function(seed = 1,
+                           N = 500,
+                           G = 1000,
+                           K = 6,
+                           P = 1,
+                           B = NULL,
+                           n_nonzero_per_condition = 2,
+                           effect_size = 1.0,
+                           balanced = TRUE,
+                           markers_per_topic = 40,
+                           sigma_eta = 0.7,
+                           depth_meanlog = log(5000),
+                           depth_sdlog = 0.5,
+                           nb_size_shape = 5,
+                           nb_size_rate = 0.5,
+                           fit_numiter = 300,
+                           eps = 1e-4,
+                           alpha = 0.05) {
+  set.seed(seed)
+
+  topic_names <- paste0("T", seq_len(K))
+  sample_names <- paste0("sample", seq_len(N))
+
+  X <- matrix(rbinom(N * P, size = 1, prob = 0.5), nrow = N, ncol = P)
+  colnames(X) <- paste0("x", seq_len(P))
+  rownames(X) <- sample_names
+
+  if (is.null(B)) {
+    B <- make_sparse_effects(
+      K = K,
+      P = P,
+      n_nonzero_per_condition = n_nonzero_per_condition,
+      effect_size = effect_size,
+      balanced = balanced
+    )
+  }
+  colnames(B) <- topic_names
+
+  topic_gene <- make_topic_gene_matrix(
+    K = K,
+    G = G,
+    markers_per_topic = markers_per_topic
+  )
+  phi_true <- topic_gene$phi
+  rownames(phi_true) <- topic_names
+
+  memb <- simulate_topic_proportions(X = X, B = B, sigma_eta = sigma_eta)
+  theta_true <- memb$theta
+  colnames(theta_true) <- topic_names
+  rownames(theta_true) <- sample_names
+
+  depth <- round(rlnorm(N, meanlog = depth_meanlog, sdlog = depth_sdlog))
+  size_g <- rgamma(G, shape = nb_size_shape, rate = nb_size_rate)
+
+  Y <- simulate_nb_counts(
+    theta = theta_true,
+    phi = phi_true,
+    depth = depth,
+    size_g = size_g
+  )
+  rownames(Y) <- sample_names
+
+  fit <- fastTopics::fit_poisson_nmf(
+    Y,
+    k = K,
+    numiter = fit_numiter,
+    verbose = "none"
+  )
+  fit_mult <- fastTopics::poisson2multinom(fit)
+  theta_hat_raw <- fit_mult$L
+  phi_hat_raw <- t(fit_mult$F)
+
+  aligned <- align_topics(
+    phi_true = phi_true,
+    theta_hat = theta_hat_raw,
+    phi_hat = phi_hat_raw
+  )
+  theta_hat <- aligned$theta
+  phi_hat <- aligned$phi
+
+  colnames(theta_hat) <- topic_names
+  rownames(theta_hat) <- sample_names
+  rownames(phi_hat) <- topic_names
+
+  design <- model.matrix(~ ., data = as.data.frame(X))
+  coef_index <- 2
+
+  truth_absolute <- B[1, ] != 0
+  names(truth_absolute) <- topic_names
+
+  truth_clr_effect <- as.numeric(B[1, ] - mean(B[1, ]))
+  names(truth_clr_effect) <- topic_names
+  truth_clr <- abs(truth_clr_effect) > 1e-12
+  names(truth_clr) <- topic_names
+
+  truth_relative <- true_pairwise_summaries(B[1, ])
+
+  eps_true <- topic_specific_eps(theta_true, c0 = eps)
+  eps_hat <- topic_specific_eps(theta_hat, c0 = eps)
+
+  tt_oracle_logit <- run_limma(
+    logit_transform(theta_true, eps = eps_true),
+    design = design,
+    coef_index = coef_index
+  )
+  q_oracle_logit <- p.adjust(tt_oracle_logit$P.Value, method = "BH")
+  det_oracle_logit <- q_oracle_logit < alpha
+
+  tt_hat_raw <- run_limma(theta_hat, design = design, coef_index = coef_index)
+  q_hat_raw <- p.adjust(tt_hat_raw$P.Value, method = "BH")
+  det_hat_raw <- q_hat_raw < alpha
+
+  tt_hat_logit <- run_limma(
+    logit_transform(theta_hat, eps = eps_hat),
+    design = design,
+    coef_index = coef_index
+  )
+  q_hat_logit <- p.adjust(tt_hat_logit$P.Value, method = "BH")
+  det_hat_logit <- q_hat_logit < alpha
+
+  tt_hat_clr <- run_limma(
+    clr_transform(theta_hat, eps = eps_hat),
+    design = design,
+    coef_index = coef_index
+  )
+  q_hat_clr <- p.adjust(tt_hat_clr$P.Value, method = "BH")
+  det_hat_clr <- q_hat_clr < alpha
+
+  pw_oracle <- pairwise_topic_summaries(
+    theta_true,
+    design,
+    coef_index = coef_index,
+    eps = eps_true,
+    alpha = alpha
+  )
+  pw_hat <- pairwise_topic_summaries(
+    theta_hat,
+    design,
+    coef_index = coef_index,
+    eps = eps_hat,
+    alpha = alpha
+  )
+
+  clr_comparison <- fit_clr_method_comparison(
+    theta = theta_hat,
+    design = design,
+    truth_clr = truth_clr,
+    truth_clr_effect = truth_clr_effect,
+    coef_index = coef_index,
+    eps_c0 = eps,
+    alpha = alpha
+  )
+
+  clr_truth_df <- data.frame(
+    topic = topic_names,
+    truth_absolute = as.logical(truth_absolute),
+    truth_clr = as.logical(truth_clr),
+    truth_clr_effect = as.numeric(truth_clr_effect),
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    X = X,
+    B = B,
+    phi_true = phi_true,
+    theta_true = theta_true,
+    depth = depth,
+    size_g = size_g,
+    Y = Y,
+    theta_hat = theta_hat,
+    phi_hat = phi_hat,
+    matched_similarity = stats::setNames(aligned$matched_similarity, topic_names),
+    truth_absolute = truth_absolute,
+    truth_clr = truth_clr,
+    truth_clr_effect = truth_clr_effect,
+    truth_relative = truth_relative,
+    topic_results = list(
+      oracle_logit = data.frame(
+        topic = topic_names,
+        tt_oracle_logit,
+        qval = q_oracle_logit,
+        detected = det_oracle_logit,
+        stringsAsFactors = FALSE
+      ),
+      hat_raw = data.frame(
+        topic = topic_names,
+        tt_hat_raw,
+        qval = q_hat_raw,
+        detected = det_hat_raw,
+        stringsAsFactors = FALSE
+      ),
+      hat_logit = data.frame(
+        topic = topic_names,
+        tt_hat_logit,
+        qval = q_hat_logit,
+        detected = det_hat_logit,
+        stringsAsFactors = FALSE
+      ),
+      hat_clr = data.frame(
+        topic = topic_names,
+        tt_hat_clr,
+        qval = q_hat_clr,
+        detected = det_hat_clr,
+        stringsAsFactors = FALSE
+      )
+    ),
+    topic_metrics = rbind(
+      oracle_logit = score_calls(det_oracle_logit, truth_absolute),
+      hat_raw = score_calls(det_hat_raw, truth_absolute),
+      hat_logit = score_calls(det_hat_logit, truth_absolute),
+      hat_clr = score_calls(det_hat_clr, truth_clr)
+    ),
+    clr_theta_hat = clr_comparison$theta_clr,
+    clr_eps_hat = clr_comparison$eps_k,
+    clr_results = clr_comparison$results,
+    clr_results_long = clr_comparison$results_long,
+    clr_method_metrics = clr_comparison$metrics,
+    clr_truth = clr_truth_df,
+    pairwise_summaries = list(
+      truth = truth_relative,
+      oracle = pw_oracle,
+      hat = pw_hat
+    )
+  )
+}
+
+run_simulation_study <- function(nsim = 50, keep_sims = TRUE, ...) {
+  sims <- if (isTRUE(keep_sims)) vector("list", nsim) else NULL
+  clr_metrics <- vector("list", nsim)
+  baseline_metrics <- vector("list", nsim)
+
+  for (s in seq_len(nsim)) {
+    cat("Running simulation", s, "of", nsim, "\n")
+    sim_obj <- one_simulation(seed = 1000 + s, ...)
+    if (isTRUE(keep_sims)) {
+      sims[[s]] <- sim_obj
+    }
+
+    this_clr <- as.data.frame(sim_obj$clr_method_metrics)
+    this_clr$method <- rownames(this_clr)
+    this_clr$sim <- s
+    rownames(this_clr) <- NULL
+    clr_metrics[[s]] <- this_clr
+
+    this_baseline <- as.data.frame(sim_obj$topic_metrics)
+    this_baseline$method <- rownames(this_baseline)
+    this_baseline$sim <- s
+    rownames(this_baseline) <- NULL
+    baseline_metrics[[s]] <- this_baseline
+  }
+
+  clr_metrics_df <- do.call(rbind, clr_metrics)
+  baseline_metrics_df <- do.call(rbind, baseline_metrics)
+  rownames(clr_metrics_df) <- NULL
+  rownames(baseline_metrics_df) <- NULL
+
+  list(
+    per_simulation = clr_metrics_df,
+    summary = summarize_method_metrics(clr_metrics_df),
+    baseline_per_simulation = baseline_metrics_df,
+    baseline_summary = summarize_method_metrics(baseline_metrics_df),
+    sims = sims
+  )
+}
+
+stack_performance_metrics <- function(per_simulation_df) {
+  rbind(
+    data.frame(
+      per_simulation_df,
+      metric = "Power",
+      value = per_simulation_df$power,
+      stringsAsFactors = FALSE
+    ),
+    data.frame(
+      per_simulation_df,
+      metric = "FDR",
+      value = per_simulation_df$FDP,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+  
+```
+
+```{r}
+setup_julia_epb <- local({
+  initialized <- FALSE
+
+  function(
+    JULIA_HOME = "/opt/anaconda3/julia_env/pyjuliapkg/install/bin",
+    project_path = "/opt/anaconda3/julia_env"
+  ) {
+    if (!initialized) {
+      library(JuliaCall)
+
+      julia_setup(JULIA_HOME = JULIA_HOME)
+      julia_command("import Pkg")
+      julia_command(sprintf('Pkg.activate("%s")', project_path))
+      julia_command("using Empirikos, Hypatia, MultipleTesting")
+
+      initialized <<- TRUE
+    }
+
+    invisible(TRUE)
+  }
+})
+
+run_epb_one_coef_from_fit <- function(fit, coef_index = 2, alpha = 0.05) {
+  coef_hat <- fit$coefficients
+  se_hat   <- sweep(fit$stdev.unscaled, 1, fit$sigma, "*")
+
+  beta_vec <- as.numeric(coef_hat[, coef_index])
+  se2_vec  <- as.numeric(se_hat[, coef_index]^2)
+
+  df_resid <- fit$df.residual
+  nu_val <- unique(as.integer(df_resid[is.finite(df_resid)]))
+
+  if (length(nu_val) != 1L) {
+    warning("Residual degrees of freedom are not identical across topics; using the first value.")
+    nu_val <- nu_val[1]
+  }
+
+  ok <- is.finite(beta_vec) & is.finite(se2_vec) & (se2_vec > 0)
+
+  adjp <- rep(NA_real_, length(beta_vec))
+  rj_idx <- rep(FALSE, length(beta_vec))
+
+  if (any(ok)) {
+    julia_assign("beta_vec_r", beta_vec[ok])
+    julia_assign("se2_vec_r", se2_vec[ok])
+    julia_assign("nu_val_r", as.integer(nu_val))
+    julia_assign("alpha_r", alpha)
+
+    julia_command("
+      samples_epb = [
+        Empirikos.NormalChiSquareSample(beta_vec_r[i], se2_vec_r[i], nu_val_r)
+        for i in eachindex(beta_vec_r)
+      ]
+    ")
+    julia_command("
+      test_epb_r = Empirikos.EmpiricalPartiallyBayesTTest(
+        α = alpha_r,
+        solver = Hypatia.Optimizer
+      )
+    ")
+    julia_command("res_epb_r = fit(test_epb_r, samples_epb)")
+
+    adjp_ok <- as.numeric(julia_eval("res_epb_r.adjp"))
+    rj_ok   <- as.logical(julia_eval("res_epb_r.rj_idx"))
+
+    adjp[ok]   <- adjp_ok
+    rj_idx[ok] <- rj_ok
+  }
+
+  list(
+    adjp = adjp,
+    rj_idx = rj_idx,
+    beta = beta_vec,
+    se = sqrt(se2_vec),
+    df = rep(as.numeric(nu_val), length(beta_vec))
+  )
+}
+
+extract_epb_np_results <- function(
+  fit,
+  coef_index = 2,
+  alpha = 0.05,
+  julia_home = "/opt/anaconda3/julia_env/pyjuliapkg/install/bin",
+  project_path = "/opt/anaconda3/julia_env"
+) {
+  topics <- resolve_fit_topics(fit)
+
+  if (!requireNamespace("JuliaCall", quietly = TRUE)) {
+    return(data.frame(
+      topic = topics,
+      method = "epb_np",
+      effect = NA_real_,
+      SE = NA_real_,
+      df = NA_real_,
+      p_value = NA_real_,
+      q_value = NA_real_,
+      lfsr = NA_real_,
+      detected = NA,
+      available = FALSE,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  setup_julia_epb(
+    JULIA_HOME = julia_home,
+    project_path = project_path
+  )
+
+  epb_out <- run_epb_one_coef_from_fit(
+    fit = fit,
+    coef_index = coef_index,
+    alpha = alpha
+  )
+
+  data.frame(
+    topic = topics,
+    method = "epb_np",
+    effect = epb_out$beta,
+    SE = epb_out$se,
+    df = epb_out$df,
+    p_value = epb_out$adjp,   # EPB returns adjusted p-values directly
+    q_value = epb_out$adjp,
+    lfsr = NA_real_,
+    detected = epb_out$rj_idx,
+    available = TRUE,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+
+fit_clr_method_comparison <- function(theta,
+                                      design,
+                                      truth_clr,
+                                      truth_clr_effect,
+                                      coef_index = 2,
+                                      eps_c0 = 1e-4,
+                                      alpha = 0.05) {
+  eps_k <- topic_specific_eps(theta, c0 = eps_c0)
+  theta_clr <- clr_transform(theta, eps = eps_k)
+
+  fit_lm <- limma::lmFit(t(theta_clr), design)
+  fit_eb <- limma::eBayes(fit_lm)
+
+
+  
+  method_results <- list(
+    no_eb = extract_nomod_results(fit_lm, coef_index = coef_index, alpha = alpha),
+    limma = extract_limma_results(fit_eb, coef_index = coef_index, alpha = alpha),
+    vashr = extract_vash_results(fit_lm, coef_index = coef_index, alpha = alpha),
+    epb_np = extract_epb_np_results(fit_lm, coef_index = coef_index, alpha = alpha),
+    mr.ashr = extract_mr_ash_results(theta_clr, design, coef_index = coef_index, alpha = alpha)
+  )
+  results_long <- do.call(
+    rbind,
+    lapply(method_results, function(df) {
+      df$truth <- truth_clr[match(df$topic, names(truth_clr))]
+      df$truth_effect <- truth_clr_effect[match(df$topic, names(truth_clr_effect))]
+      df
+    })
+  )
+  rownames(results_long) <- NULL
+
+  metrics <- do.call(
+    rbind,
+    lapply(method_results, function(df) {
+      df$truth <- truth_clr[match(df$topic, names(truth_clr))]
+      score_calls(df$detected, df$truth)
+    })
+  )
+
+  list(
+    theta_clr = theta_clr,
+    eps_k = eps_k,
+    results = method_results,
+    results_long = results_long,
+    metrics = metrics
+  )
+}
+
+
+```
+
+## benchmark
+```{r}
+
+summarize_benchmark_performance <- function(per_simulation_df) {
+  perf_long <- stack_performance_metrics(per_simulation_df)
+
+  grouping_keys <- unique(
+    perf_long[, c(
+      "varying_param", "varying_value", "method", "metric",
+      "N", "G", "K", "markers_per_topic", "n_nonzero_per_condition",
+      "effect_size", "sigma_eta",
+      "depth_meanlog", "depth_sdlog",
+      "nb_size_shape", "nb_size_rate",
+      "fit_numiter", "alpha"
+    )]
+  )
+
+  rows <- vector("list", nrow(grouping_keys))
+  for (i in seq_len(nrow(grouping_keys))) {
+    key <- grouping_keys[i, , drop = FALSE]
+    keep <- perf_long$varying_param == key$varying_param &
+      perf_long$varying_value == key$varying_value &
+      perf_long$method == key$method &
+      perf_long$metric == key$metric
+
+    x <- perf_long$value[keep]
+    x <- as.numeric(x[is.finite(x)])
+    n <- length(x)
+    mean_x <- if (n) mean(x) else NA_real_
+    sd_x <- if (n > 1L) stats::sd(x) else 0
+    se_x <- if (n) sd_x / sqrt(n) else NA_real_
+
+    rows[[i]] <- cbind(
+      key,
+      n = n,
+      mean = mean_x,
+      sd = sd_x,
+      ci95_lo = if (n) mean_x - 1.96 * se_x else NA_real_,
+      ci95_hi = if (n) mean_x + 1.96 * se_x else NA_real_
+    )
+  }
+
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+
+plot_benchmark_curve <- function(summary_df, varying_param) {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop("The 'ggplot2' package is required for plotting.", call. = FALSE)
+  }
+
+  summary_sub <- summary_df[summary_df$varying_param == varying_param, , drop = FALSE]
+  if (!nrow(summary_sub)) {
+    stop(sprintf("No rows found for varying_param = '%s'.", varying_param), call. = FALSE)
+  }
+
+  # summary_sub$method <- factor(
+  #   summary_sub$method,
+  #   levels = c("no_eb", "limma", "vashr", "mr.ashr")
+  # )
+  summary_sub$method <- factor(
+    summary_sub$method,
+    levels = c("no_eb", "limma", "vashr", "epb_np", "mr.ashr")
+  )
+
+  summary_sub$x_plot <- factor(summary_sub$varying_value, levels = sort(unique(summary_sub$varying_value)))
+
+  label_map <- c(
+    G = "Number of genes (G)",
+    K = "Number of topics (K)",
+    markers_per_topic = "Marker genes per topic",
+    n_nonzero_per_condition = "Nonzero topics per condition",
+    N = "Sample size (N)",
+    effect_size = "Effect size",
+    sigma_eta = "sigma_eta"
+  )
+
+  xlab <- if (varying_param %in% names(label_map)) label_map[[varying_param]] else varying_param
+
+  pd <- ggplot2::position_dodge(width = 0.5)
+
+  ggplot2::ggplot(
+    summary_sub,
+    ggplot2::aes(x = x_plot, y = mean, color = method, group = method)
+  ) +
+    ggplot2::geom_hline(
+      data = summary_sub[summary_sub$metric == "FDR", , drop = FALSE],
+      ggplot2::aes(yintercept = 0.05),
+      inherit.aes = FALSE,
+      linetype = "dashed",
+      color = "grey50"
+    ) +
+    ggplot2::geom_line(ggplot2::aes(linetype = method)) +
+    ggplot2::geom_point(
+      ggplot2::aes(shape = method),
+      size = 2.5,
+      position = pd
+    ) +
+    ggplot2::geom_errorbar(
+      ggplot2::aes(ymin = ci95_lo, ymax = ci95_hi),
+      width = 0.15,
+      linewidth = 0.5,
+      position = pd
+    ) +
+    ggplot2::facet_wrap(~ metric, scales = "free_y") +
+    ggplot2::theme_bw() +
+    ggplot2::labs(
+      x = xlab,
+      y = "Across-replicate estimate",
+      color = "Method",
+      shape = "Method",
+      linetype = "Method",
+      title = paste("CLR performance as a function of", xlab)
+    )
+}
+
+validate_benchmark_grid <- function(settings_df) {
+  bad <- settings_df$G < (settings_df$K * settings_df$markers_per_topic)
+  if (any(bad)) {
+    bad_rows <- settings_df[bad, , drop = FALSE]
+    stop(
+      sprintf(
+        "Invalid benchmark settings: need G >= K * markers_per_topic. Bad rows: %s",
+        paste(
+          apply(
+            bad_rows,
+            1,
+            function(z) paste(names(bad_rows), z, sep = "=", collapse = ", ")
+          ),
+          collapse = " | "
+        )
+      ),
+      call. = FALSE
+    )
+  }
+  invisible(settings_df)
+}
+
+make_benchmark_settings <- function(
+    N = 250,
+    G = 1000,
+    K = 6,
+    markers_per_topic = 40,
+    n_nonzero_per_condition = 2,
+    effect_size = 1.0,
+    sigma_eta = 0.7,
+    depth_meanlog = log(5000),
+    depth_sdlog = 0.5,
+    nb_size_shape = 5,
+    nb_size_rate = 0.5,
+    fit_numiter = 120,
+    alpha = 0.05,
+    sweep_values = list(
+      N = c(80, 150, 250),
+      G = c(300, 600, 1000, 1600),
+      K = c(4, 6, 8, 10),
+      markers_per_topic = c(10, 20, 40, 60),
+      n_nonzero_per_condition = c(1, 2, 3, 4),
+      effect_size = c(0.2, 0.4, 0.7, 1.0),
+      sigma_eta = c(0.5, 0.7, 1.0, 1.3)
+    )) {
+
+  baseline <- list(
+    N = N,
+    G = G,
+    K = K,
+    markers_per_topic = markers_per_topic,
+    n_nonzero_per_condition = n_nonzero_per_condition,
+    effect_size = effect_size,
+    sigma_eta = sigma_eta,
+    depth_meanlog = depth_meanlog,
+    depth_sdlog = depth_sdlog,
+    nb_size_shape = nb_size_shape,
+    nb_size_rate = nb_size_rate,
+    fit_numiter = fit_numiter,
+    alpha = alpha
+  )
+
+  settings <- list()
+  idx <- 1L
+
+  for (nm in names(sweep_values)) {
+    vals <- sweep_values[[nm]]
+    for (val in vals) {
+      cur <- baseline
+      cur[[nm]] <- val
+
+      settings[[idx]] <- data.frame(
+        setting_id = idx,
+        varying_param = nm,
+        varying_value = as.numeric(val),
+        N = cur$N,
+        G = cur$G,
+        K = cur$K,
+        markers_per_topic = cur$markers_per_topic,
+        n_nonzero_per_condition = cur$n_nonzero_per_condition,
+        effect_size = cur$effect_size,
+        sigma_eta = cur$sigma_eta,
+        depth_meanlog = cur$depth_meanlog,
+        depth_sdlog = cur$depth_sdlog,
+        nb_size_shape = cur$nb_size_shape,
+        nb_size_rate = cur$nb_size_rate,
+        fit_numiter = cur$fit_numiter,
+        alpha = cur$alpha,
+        stringsAsFactors = FALSE
+      )
+      idx <- idx + 1L
+    }
+  }
+
+  settings_df <- do.call(rbind, settings)
+  rownames(settings_df) <- NULL
+  validate_benchmark_grid(settings_df)
+  settings_df
+}
+
+
+run_difficulty_benchmark <- function(
+    nsim = 10,
+    N = 250,
+    G = 1000,
+    K = 6,
+    markers_per_topic = 40,
+    n_nonzero_per_condition = 2,
+    effect_size = 1.0,
+    sigma_eta = 0.7,
+    depth_meanlog = log(5000),
+    depth_sdlog = 0.5,
+    nb_size_shape = 5,
+    nb_size_rate = 0.5,
+    fit_numiter = 120,
+    alpha = 0.05,
+    sweep_values = list(
+      N = c(80, 150, 250),
+      G = c(300, 600, 1000, 1600),
+      K = c(4, 6, 8, 10),
+      markers_per_topic = c(10, 20, 40, 60),
+      n_nonzero_per_condition = c(1, 2, 3, 4),
+      effect_size = c(0.2, 0.4, 0.7, 1.0),
+      sigma_eta = c(0.5, 0.7, 1.0, 1.3)
+    ),
+    save_sims = FALSE) {
+
+  settings_df <- make_benchmark_settings(
+    N = N,
+    G = G,
+    K = K,
+    markers_per_topic = markers_per_topic,
+    n_nonzero_per_condition = n_nonzero_per_condition,
+    effect_size = effect_size,
+    sigma_eta = sigma_eta,
+    depth_meanlog = depth_meanlog,
+    depth_sdlog = depth_sdlog,
+    nb_size_shape = nb_size_shape,
+    nb_size_rate = nb_size_rate,
+    fit_numiter = fit_numiter,
+    alpha = alpha,
+    sweep_values = sweep_values
+  )
+
+  per_setting <- vector("list", nrow(settings_df))
+  summary_rows <- vector("list", nrow(settings_df))
+
+  for (i in seq_len(nrow(settings_df))) {
+    setting <- settings_df[i, , drop = FALSE]
+    cat(
+      "Benchmark setting", i, "of", nrow(settings_df), ":",
+      setting$varying_param, "=", setting$varying_value, "\n"
+    )
+
+    study <- run_simulation_study(
+      nsim = nsim,
+      keep_sims = save_sims,
+      N = setting$N,
+      G = setting$G,
+      K = setting$K,
+      P = 1,
+      markers_per_topic = setting$markers_per_topic,
+      n_nonzero_per_condition = setting$n_nonzero_per_condition,
+      effect_size = setting$effect_size,
+      sigma_eta = setting$sigma_eta,
+      depth_meanlog = setting$depth_meanlog,
+      depth_sdlog = setting$depth_sdlog,
+      nb_size_shape = setting$nb_size_shape,
+      nb_size_rate = setting$nb_size_rate,
+      fit_numiter = setting$fit_numiter,
+      alpha = setting$alpha
+    )
+
+    per_sim <- study$per_simulation
+    per_sim$setting_id <- setting$setting_id
+    per_sim$varying_param <- setting$varying_param
+    per_sim$varying_value <- setting$varying_value
+    per_sim$N <- setting$N
+    per_sim$G <- setting$G
+    per_sim$K <- setting$K
+    per_sim$markers_per_topic <- setting$markers_per_topic
+    per_sim$n_nonzero_per_condition <- setting$n_nonzero_per_condition
+    per_sim$effect_size <- setting$effect_size
+    per_sim$sigma_eta <- setting$sigma_eta
+    per_sim$depth_meanlog <- setting$depth_meanlog
+    per_sim$depth_sdlog <- setting$depth_sdlog
+    per_sim$nb_size_shape <- setting$nb_size_shape
+    per_sim$nb_size_rate <- setting$nb_size_rate
+    per_sim$fit_numiter <- setting$fit_numiter
+    per_sim$alpha <- setting$alpha
+
+    per_setting[[i]] <- per_sim
+
+    setting_summary <- study$summary
+    setting_summary$setting_id <- setting$setting_id
+    setting_summary$varying_param <- setting$varying_param
+    setting_summary$varying_value <- setting$varying_value
+    setting_summary$N <- setting$N
+    setting_summary$G <- setting$G
+    setting_summary$K <- setting$K
+    setting_summary$markers_per_topic <- setting$markers_per_topic
+    setting_summary$n_nonzero_per_condition <- setting$n_nonzero_per_condition
+    setting_summary$effect_size <- setting$effect_size
+    setting_summary$sigma_eta <- setting$sigma_eta
+    setting_summary$depth_meanlog <- setting$depth_meanlog
+    setting_summary$depth_sdlog <- setting$depth_sdlog
+    setting_summary$nb_size_shape <- setting$nb_size_shape
+    setting_summary$nb_size_rate <- setting$nb_size_rate
+    setting_summary$fit_numiter <- setting$fit_numiter
+    setting_summary$alpha <- setting$alpha
+
+    summary_rows[[i]] <- setting_summary
+  }
+
+  per_simulation_df <- do.call(rbind, per_setting)
+  per_setting_summary_df <- do.call(rbind, summary_rows)
+  curve_summary_df <- summarize_benchmark_performance(per_simulation_df)
+
+  rownames(per_simulation_df) <- NULL
+  rownames(per_setting_summary_df) <- NULL
+  rownames(curve_summary_df) <- NULL
+
+  list(
+    settings = settings_df,
+    per_simulation = per_simulation_df,
+    per_setting_summary = per_setting_summary_df,
+    curve_summary = curve_summary_df
+  )
+}
+```
+
+```{r}
+benchmark_small <- run_difficulty_benchmark(
+  nsim = 60,
+  N = 120,
+  G = 600,
+  K = 6,
+  markers_per_topic = 20,
+  n_nonzero_per_condition = 2,
+  effect_size = 0.5,
+  sigma_eta = 1.0,
+  fit_numiter = 80,
+  sweep_values = list(
+    G = c(300, 600, 1000, 1500),
+    K = c(6, 10, 14, 18),
+    markers_per_topic = c(10, 20, 30),
+    effect_size = c(0.2, 0.4, 0.7),
+    sigma_eta = c(0.7, 1.0, 1.3),
+    n_nonzero_per_condition = c(1, 2,3)
+  ),
+  save_sims = FALSE
+)
+```
+
+```{r}
+# setwd("/Users/ruisi/Desktop/Cancer")
+benchmark_small$curve_summary
+print(plot_benchmark_curve(benchmark_small$curve_summary, "effect_size"))
+print(plot_benchmark_curve(benchmark_small$curve_summary, "sigma_eta"))
+# print(plot_benchmark_curve(benchmark_small$curve_summary, "N"))
+
+print(plot_benchmark_curve(benchmark_small$curve_summary, "G"))
+print( plot_benchmark_curve(benchmark_small$curve_summary, varying_param = "K"))
+print(plot_benchmark_curve(benchmark_small$curve_summary, varying_param = "markers_per_topic"))
+print(plot_benchmark_curve(benchmark_small$curve_summary, varying_param = "n_nonzero_per_condition"))
+
+```
+
+```{r}
+single <- one_simulation(
+  seed = 1,
+  N = 120,
+  G = 600,
+  K = 6,
+  effect_size = 0.5,
+  sigma_eta = 1.0,
+  markers_per_topic = 20,
+  fit_numiter = 80
+)
+
+plots <- build_diagnostic_plots(single)
+names(plots)
+```
+
+```{r}
+print(plots$ground_truth_topics)
+print(plots$fitted_topics)
+print(plots$true_membership)
+print(plots$fitted_membership)
+print(plots$alignment)
+```
+
